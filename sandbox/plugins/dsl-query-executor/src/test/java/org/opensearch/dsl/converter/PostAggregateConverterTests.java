@@ -40,10 +40,12 @@ public class PostAggregateConverterTests extends OpenSearchTestCase {
 
     public void testSkipsWhenNoBucketOrders() throws ConversionException {
         // Metric-only agg has no bucket orders
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.of(new AvgAggregationBuilder("avg_price").field("price")),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.of(new AvgAggregationBuilder("avg_price").field("price")),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         ConversionContext aggCtx = ctx.withAggregationMetadata(metadataList.get(0));
         RelNode agg = aggConverter.convert(scan, metadataList.get(0));
@@ -54,12 +56,15 @@ public class PostAggregateConverterTests extends OpenSearchTestCase {
 
     public void testAppliesDefaultCountDescOrder() throws ConversionException {
         // Default terms order is _count desc
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.of(
-                new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
-            ),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.of(
+                    new TermsAggregationBuilder("by_brand").field("brand")
+                        .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                ),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         ConversionContext aggCtx = ctx.withAggregationMetadata(metadataList.get(0));
         RelNode agg = aggConverter.convert(scan, metadataList.get(0));
@@ -82,14 +87,16 @@ public class PostAggregateConverterTests extends OpenSearchTestCase {
     }
 
     public void testAppliesKeyAscOrder() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(
-                new TermsAggregationBuilder("by_brand").field("brand")
-                    .order(BucketOrder.key(true))
-                    .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
-            ),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(
+                    new TermsAggregationBuilder("by_brand").field("brand")
+                        .order(BucketOrder.key(true))
+                        .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                ),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         ConversionContext aggCtx = ctx.withAggregationMetadata(metadataList.get(0));
         RelNode agg = aggConverter.convert(scan, metadataList.get(0));
@@ -109,14 +116,16 @@ public class PostAggregateConverterTests extends OpenSearchTestCase {
     }
 
     public void testAppliesMetricOrder() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(
-                new TermsAggregationBuilder("by_brand").field("brand")
-                    .order(BucketOrder.aggregation("avg_price", false))
-                    .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
-            ),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(
+                    new TermsAggregationBuilder("by_brand").field("brand")
+                        .order(BucketOrder.aggregation("avg_price", false))
+                        .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                ),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         ConversionContext aggCtx = ctx.withAggregationMetadata(metadataList.get(0));
         RelNode agg = aggConverter.convert(scan, metadataList.get(0));
@@ -138,10 +147,12 @@ public class PostAggregateConverterTests extends OpenSearchTestCase {
     }
 
     public void testPostAggInputIsLogicalAggregate() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(new TermsAggregationBuilder("by_brand").field("brand").order(BucketOrder.key(true))),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(new TermsAggregationBuilder("by_brand").field("brand").order(BucketOrder.key(true))),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         ConversionContext aggCtx = ctx.withAggregationMetadata(metadataList.get(0));
         RelNode agg = aggConverter.convert(scan, metadataList.get(0));

@@ -22,6 +22,7 @@ import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.dsl.golden.CalciteTestInfra;
 import org.opensearch.dsl.golden.GoldenFileLoader;
@@ -145,6 +146,49 @@ public class SearchSourceConverterTests extends OpenSearchTestCase {
         assertTrue(plans.has(QueryPlans.Type.AGGREGATION));
         // Metric-only agg has no bucket orders, so no LogicalSort wrapper
         assertFalse(plans.get(QueryPlans.Type.AGGREGATION).get(0).relNode() instanceof LogicalSort);
+    }
+
+    public void testHitsPlanCarriesRootGranularity() throws ConversionException {
+        QueryPlans plans = converter.convert(new SearchSourceBuilder(), "test-index");
+
+        assertEquals(GranularityKeys.ROOT, plans.get(QueryPlans.Type.HITS).get(0).granularity());
+    }
+
+    public void testAggregationPlansCarryDistinctGranularities() throws ConversionException {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .aggregation(
+                new TermsAggregationBuilder("by_brand").field("brand")
+                    .subAggregation(new AvgAggregationBuilder("brand_avg").field("price"))
+                    .subAggregation(
+                        new TermsAggregationBuilder("by_name").field("name")
+                            .subAggregation(new AvgAggregationBuilder("name_avg").field("price"))
+                    )
+            );
+        QueryPlans plans = converter.convert(source, "test-index");
+
+        List<QueryPlans.QueryPlan> aggPlans = plans.get(QueryPlans.Type.AGGREGATION);
+        assertEquals(2, aggPlans.size());
+        String parent = aggPlans.get(0).granularity();
+        String child = aggPlans.get(1).granularity();
+        assertNotEquals(parent, child);
+        // The shallower key is a strict prefix of the deeper one, which is what lets response
+        // assembly attach child buckets under their parent. (GranularityKeys.isAncestorKey, which
+        // asserts the same property including the level boundary, arrives with the assembler.)
+        assertTrue(parent + " should be a strict prefix of " + child, child.startsWith(parent));
+        assertNotEquals(GranularityKeys.ROOT, parent);
+    }
+
+    public void testSiblingAggregationsOnSameFieldYieldTwoPlans() throws ConversionException {
+        // Two aggregations over the same field are two granularities: a field-only granularity key
+        // merged them into a single plan and lost bucket identity.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .aggregation(new TermsAggregationBuilder("a").field("brand").subAggregation(new AvgAggregationBuilder("avg").field("price")))
+            .aggregation(new TermsAggregationBuilder("b").field("brand").subAggregation(new AvgAggregationBuilder("avg2").field("rating")));
+        QueryPlans plans = converter.convert(source, "test-index");
+
+        List<QueryPlans.QueryPlan> aggPlans = plans.get(QueryPlans.Type.AGGREGATION);
+        assertEquals(2, aggPlans.size());
+        assertNotEquals(aggPlans.get(0).granularity(), aggPlans.get(1).granularity());
     }
 
     // ---- Golden file driven RelNode generation tests ----

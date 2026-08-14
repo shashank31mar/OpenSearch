@@ -11,6 +11,7 @@ package org.opensearch.dsl.executor;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.dsl.TestUtils;
+import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.dsl.result.ExecutionResult;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -30,7 +31,7 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         List<Object[]> expectedRows = List.<Object[]>of(new Object[] { "laptop", 1200 });
 
         DslQueryPlanExecutor executor = new DslQueryPlanExecutor((plan, ctx, listener) -> listener.onResponse(expectedRows));
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, scan)).build();
+        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, scan, GranularityKeys.ROOT)).build();
 
         PlainActionFuture<List<ExecutionResult>> future = new PlainActionFuture<>();
         executor.execute(plans, future);

@@ -35,7 +35,7 @@ public class TermsBucketTranslator implements BucketTranslator<TermsAggregationB
 
     @Override
     public GroupingInfo getGrouping(TermsAggregationBuilder agg) {
-        return new FieldGrouping(List.of(agg.field()));
+        return new FieldGrouping(agg.getName(), List.of(agg.field()));
     }
 
     @Override

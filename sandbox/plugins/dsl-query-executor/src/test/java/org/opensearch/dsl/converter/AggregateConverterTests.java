@@ -29,10 +29,12 @@ public class AggregateConverterTests extends OpenSearchTestCase {
     private final LogicalTableScan scan = TestUtils.createTestRelNode();
 
     public void testMetricOnlyProducesAggregateWithNoGroupBy() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(new AvgAggregationBuilder("avg_price").field("price")),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(new AvgAggregationBuilder("avg_price").field("price")),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
 
         RelNode result = converter.convert(scan, metadataList.get(0));
@@ -44,12 +46,15 @@ public class AggregateConverterTests extends OpenSearchTestCase {
     }
 
     public void testBucketWithMetricProducesGroupBy() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(
-                new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
-            ),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(
+                    new TermsAggregationBuilder("by_brand").field("brand")
+                        .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                ),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
 
         RelNode result = converter.convert(scan, metadataList.get(0));
@@ -61,10 +66,12 @@ public class AggregateConverterTests extends OpenSearchTestCase {
     }
 
     public void testInputIsScan() throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(new AvgAggregationBuilder("avg_price").field("price")),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(new AvgAggregationBuilder("avg_price").field("price")),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
 
         RelNode result = converter.convert(scan, metadataList.get(0));

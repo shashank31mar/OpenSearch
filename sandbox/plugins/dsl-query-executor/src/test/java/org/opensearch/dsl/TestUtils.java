@@ -24,6 +24,8 @@ import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.impl.AbstractTable;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.opensearch.dsl.aggregation.AggregationMetadata;
+import org.opensearch.dsl.aggregation.AggregationTreeWalker;
 import org.opensearch.dsl.converter.ConversionContext;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
@@ -60,6 +62,16 @@ public class TestUtils {
     /** Creates a ConversionContext with an empty search source and standard test schema. */
     public static ConversionContext createContext() {
         return createContext(new SearchSourceBuilder());
+    }
+
+    /**
+     * Drops the granularity keys from walker output, for tests that assert on metadata only.
+     *
+     * @param granularities the walker output
+     * @return the metadata, in walker order
+     */
+    public static List<AggregationMetadata> metadataOf(List<AggregationTreeWalker.Granularity> granularities) {
+        return granularities.stream().map(AggregationTreeWalker.Granularity::metadata).toList();
     }
 
     private static Infra buildInfra() {

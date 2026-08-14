@@ -29,7 +29,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
     public void testMetricOnly() throws ConversionException {
         List<AggregationBuilder> aggs = List.of(new AvgAggregationBuilder("avg_price").field("price"));
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(1, result.size());
         assertTrue(result.get(0).getGroupByBitSet().isEmpty());
@@ -44,7 +44,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
             new SumAggregationBuilder("total_price").field("price")
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(1, result.size());
         assertEquals(2, result.get(0).getAggregateCalls().size());
@@ -56,7 +56,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
             new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(1, result.size());
         assertFalse(result.get(0).getGroupByBitSet().isEmpty());
@@ -72,7 +72,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
         // terms bucket with no explicit metrics — still produces metadata with implicit _count
         List<AggregationBuilder> aggs = List.of(new TermsAggregationBuilder("by_brand").field("brand"));
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(1, result.size());
         assertEquals(1, result.get(0).getAggregateCalls().size());
@@ -89,7 +89,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
                 )
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(2, result.size());
         // Brand granularity: SUM + implicit _count
@@ -106,7 +106,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
             new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("brand_avg").field("price"))
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(2, result.size());
         // Root: no GROUP BY, no implicit _count
@@ -124,7 +124,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
             new TermsAggregationBuilder("by_name").field("name").subAggregation(new SumAggregationBuilder("name_total").field("price"))
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(2, result.size());
         // brand granularity: AVG + _count
@@ -142,7 +142,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
                 .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertTrue(result.get(0).hasBucketOrders());
         assertFalse(result.get(0).getBucketOrders().isEmpty());
@@ -152,7 +152,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
         // Default terms order is _count desc — should still be collected
         List<AggregationBuilder> aggs = List.of(new TermsAggregationBuilder("by_brand").field("brand"));
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertTrue(result.get(0).hasBucketOrders());
     }
@@ -160,7 +160,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
     public void testMetricOnlyHasNoBucketOrders() throws ConversionException {
         List<AggregationBuilder> aggs = List.of(new AvgAggregationBuilder("avg_price").field("price"));
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertFalse(result.get(0).hasBucketOrders());
     }
@@ -176,7 +176,7 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
                 )
         );
 
-        List<AggregationMetadata> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+        List<AggregationMetadata> result = TestUtils.metadataOf(walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
 
         assertEquals(2, result.size());
         // Both granularities have bucket orders
@@ -188,5 +188,45 @@ public class AggregationTreeWalkerTests extends OpenSearchTestCase {
         List<AggregationBuilder> aggs = List.of(new HistogramAggregationBuilder("by_price").field("price").interval(100));
 
         expectThrows(ConversionException.class, () -> walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory()));
+    }
+
+    public void testSiblingSameFieldDifferentAggNamesProduceSeparateGranularities() throws ConversionException {
+        // Both siblings group by "brand", so a field-only granularity key merged them into ONE
+        // metadata carrying both metrics. Bucket identity is per aggregation, not per field.
+        List<AggregationBuilder> aggs = List.of(
+            new TermsAggregationBuilder("a").field("brand").subAggregation(new AvgAggregationBuilder("avg_price").field("price")),
+            new TermsAggregationBuilder("b").field("brand").subAggregation(new SumAggregationBuilder("total_price").field("price"))
+        );
+
+        List<AggregationTreeWalker.Granularity> result = walker.walk(aggs, ctx.getRowType(), ctx.getCluster().getTypeFactory());
+
+        assertEquals(2, result.size());
+        assertNotEquals(result.get(0).key(), result.get(1).key());
+        assertEquals(List.of("brand"), result.get(0).metadata().getGroupByFieldNames());
+        assertEquals(List.of("brand"), result.get(1).metadata().getGroupByFieldNames());
+        // "a" carries only the AVG, "b" only the SUM — plus each level's own implicit _count.
+        assertEquals(List.of("avg_price", "_count"), result.get(0).metadata().getAggregateFieldNames());
+        assertEquals(List.of("total_price", "_count"), result.get(1).metadata().getAggregateFieldNames());
+    }
+
+    public void testSiblingSameFieldDifferentOrdersDoNotMergeBucketOrders() throws ConversionException {
+        TermsAggregationBuilder a = new TermsAggregationBuilder("a").field("brand")
+            .order(BucketOrder.key(true))
+            .subAggregation(new AvgAggregationBuilder("avg_price").field("price"));
+        TermsAggregationBuilder b = new TermsAggregationBuilder("b").field("brand")
+            .order(BucketOrder.count(false))
+            .subAggregation(new SumAggregationBuilder("total_price").field("price"));
+
+        List<AggregationMetadata> result = TestUtils.metadataOf(
+            walker.walk(List.of(a, b), ctx.getRowType(), ctx.getCluster().getTypeFactory())
+        );
+
+        // Each granularity carries exactly its own order: "a" its key order, "b" its count order
+        // (which TermsAggregationBuilder compounds with a key tiebreaker and addBucketOrder then
+        // flattens). Sharing one builder merged both siblings' orders into both plans, so each
+        // sorted post-aggregation by the other's order too.
+        assertEquals(2, result.size());
+        assertEquals(List.of(BucketOrder.key(true)), result.get(0).getBucketOrders());
+        assertEquals(List.of(BucketOrder.count(false), BucketOrder.key(true)), result.get(1).getBucketOrders());
     }
 }

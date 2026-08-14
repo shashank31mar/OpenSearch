@@ -10,7 +10,11 @@ package org.opensearch.dsl.executor;
 
 import org.apache.calcite.rel.RelNode;
 import org.opensearch.dsl.TestUtils;
+import org.opensearch.dsl.aggregation.FieldGrouping;
+import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.test.OpenSearchTestCase;
+
+import java.util.List;
 
 public class QueryPlansTests extends OpenSearchTestCase {
 
@@ -23,7 +27,8 @@ public class QueryPlansTests extends OpenSearchTestCase {
     }
 
     public void testBuilderCreatesSinglePlan() {
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode)).build();
+        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, GranularityKeys.ROOT))
+            .build();
 
         assertEquals(1, plans.getAll().size());
         assertTrue(plans.has(QueryPlans.Type.HITS));
@@ -31,8 +36,8 @@ public class QueryPlansTests extends OpenSearchTestCase {
     }
 
     public void testBuilderCreatesMultiplePlans() {
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode))
-            .add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode))
+        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, GranularityKeys.ROOT))
+            .add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode, GranularityKeys.ROOT))
             .build();
 
         assertEquals(2, plans.getAll().size());
@@ -43,9 +48,9 @@ public class QueryPlansTests extends OpenSearchTestCase {
     }
 
     public void testGetReturnsMultiplePlansOfSameType() {
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode))
-            .add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode))
-            .build();
+        QueryPlans plans = new QueryPlans.Builder().add(
+            new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode, GranularityKeys.ROOT)
+        ).add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode, GranularityKeys.ROOT)).build();
 
         assertEquals(2, plans.get(QueryPlans.Type.AGGREGATION).size());
     }
@@ -57,22 +62,37 @@ public class QueryPlansTests extends OpenSearchTestCase {
     }
 
     public void testGetReturnsEmptyForMissingType() {
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode)).build();
+        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, GranularityKeys.ROOT))
+            .build();
 
         assertTrue(plans.get(QueryPlans.Type.AGGREGATION).isEmpty());
     }
 
     public void testPlansAreImmutable() {
-        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode)).build();
+        QueryPlans plans = new QueryPlans.Builder().add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, GranularityKeys.ROOT))
+            .build();
 
         expectThrows(
             UnsupportedOperationException.class,
-            () -> plans.getAll().add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode))
+            () -> plans.getAll().add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode, GranularityKeys.ROOT))
         );
     }
 
     public void testQueryPlanRejectsNullArguments() {
-        expectThrows(NullPointerException.class, () -> new QueryPlans.QueryPlan(QueryPlans.Type.HITS, null));
-        expectThrows(NullPointerException.class, () -> new QueryPlans.QueryPlan(null, relNode));
+        expectThrows(NullPointerException.class, () -> new QueryPlans.QueryPlan(QueryPlans.Type.HITS, null, GranularityKeys.ROOT));
+        expectThrows(NullPointerException.class, () -> new QueryPlans.QueryPlan(null, relNode, GranularityKeys.ROOT));
+    }
+
+    public void testQueryPlanCarriesGranularity() {
+        String granularity = GranularityKeys.granularityKey(List.of(new FieldGrouping("by_brand", List.of("brand"))));
+
+        QueryPlans.QueryPlan plan = new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, relNode, granularity);
+
+        assertEquals(granularity, plan.granularity());
+        assertEquals(GranularityKeys.ROOT, new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, GranularityKeys.ROOT).granularity());
+    }
+
+    public void testQueryPlanRejectsNullGranularity() {
+        expectThrows(NullPointerException.class, () -> new QueryPlans.QueryPlan(QueryPlans.Type.HITS, relNode, null));
     }
 }

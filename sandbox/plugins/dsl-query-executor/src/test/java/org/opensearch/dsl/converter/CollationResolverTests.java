@@ -30,7 +30,9 @@ public class CollationResolverTests extends OpenSearchTestCase {
     private final LogicalTableScan scan = TestUtils.createTestRelNode();
 
     private AggregationMetadata walkAndGetMetadata(List<AggregationBuilder> aggs) throws ConversionException {
-        List<AggregationMetadata> metadataList = walker.walk(aggs, scan.getRowType(), scan.getCluster().getTypeFactory());
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(aggs, scan.getRowType(), scan.getCluster().getTypeFactory())
+        );
         return metadataList.get(0);
     }
 
@@ -161,17 +163,19 @@ public class CollationResolverTests extends OpenSearchTestCase {
 
     public void testMultipleGroupByFieldsKeyOrder() throws ConversionException {
         // Get the nested granularity (brand + name)
-        List<AggregationMetadata> metadataList = walker.walk(
-            List.<AggregationBuilder>of(
-                new TermsAggregationBuilder("by_brand").field("brand")
-                    .subAggregation(
-                        new TermsAggregationBuilder("by_name").field("name")
-                            .order(BucketOrder.key(true))
-                            .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
-                    )
-            ),
-            scan.getRowType(),
-            scan.getCluster().getTypeFactory()
+        List<AggregationMetadata> metadataList = TestUtils.metadataOf(
+            walker.walk(
+                List.<AggregationBuilder>of(
+                    new TermsAggregationBuilder("by_brand").field("brand")
+                        .subAggregation(
+                            new TermsAggregationBuilder("by_name").field("name")
+                                .order(BucketOrder.key(true))
+                                .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                        )
+                ),
+                scan.getRowType(),
+                scan.getCluster().getTypeFactory()
+            )
         );
         // Second granularity has both brand and name as group-by fields
         AggregationMetadata nestedMetadata = metadataList.get(1);

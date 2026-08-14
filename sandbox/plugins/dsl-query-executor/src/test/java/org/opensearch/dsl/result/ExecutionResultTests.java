@@ -9,6 +9,7 @@
 package org.opensearch.dsl.result;
 
 import org.opensearch.dsl.TestUtils;
+import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -17,7 +18,7 @@ import java.util.List;
 public class ExecutionResultTests extends OpenSearchTestCase {
 
     public void testExecutionResultCarriesPlanAndRows() {
-        QueryPlans.QueryPlan plan = new QueryPlans.QueryPlan(QueryPlans.Type.HITS, TestUtils.createTestRelNode());
+        QueryPlans.QueryPlan plan = new QueryPlans.QueryPlan(QueryPlans.Type.HITS, TestUtils.createTestRelNode(), GranularityKeys.ROOT);
         List<Object[]> rows = List.<Object[]>of(new Object[] { "laptop", 1200, "brandX", 4.5 });
         ExecutionResult result = new ExecutionResult(plan, rows);
 
@@ -31,7 +32,7 @@ public class ExecutionResultTests extends OpenSearchTestCase {
     }
 
     public void testRejectsNullArguments() {
-        QueryPlans.QueryPlan plan = new QueryPlans.QueryPlan(QueryPlans.Type.HITS, TestUtils.createTestRelNode());
+        QueryPlans.QueryPlan plan = new QueryPlans.QueryPlan(QueryPlans.Type.HITS, TestUtils.createTestRelNode(), GranularityKeys.ROOT);
         expectThrows(NullPointerException.class, () -> new ExecutionResult(null, List.of()));
         expectThrows(NullPointerException.class, () -> new ExecutionResult(plan, null));
     }

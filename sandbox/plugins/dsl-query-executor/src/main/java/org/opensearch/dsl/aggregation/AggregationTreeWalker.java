@@ -20,8 +20,6 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 /**
  * Recursively walks the DSL aggregation tree and produces one {@link AggregationMetadata}
@@ -32,6 +30,15 @@ import java.util.stream.IntStream;
  * each yielding its own {@code LogicalAggregate} and {@code QueryPlan}.
  */
 public class AggregationTreeWalker {
+
+    /**
+     * One granularity level: the metadata for it, paired with the key that identifies it.
+     *
+     * @param key the granularity key built by {@link GranularityKeys#granularityKey(List)}
+     * @param metadata the metadata for this granularity
+     */
+    public record Granularity(String key, AggregationMetadata metadata) {
+    }
 
     private final AggregationRegistry registry;
 
@@ -45,23 +52,27 @@ public class AggregationTreeWalker {
     }
 
     /**
-     * Walks the aggregation tree and returns one AggregationMetadata per granularity level.
+     * Walks the aggregation tree and returns one granularity per distinct bucket path.
+     *
+     * <p>The granularity key travels with the metadata so the plan built from it can carry the
+     * identity of the level it populates — list position is not an identity.
      *
      * @param aggs the top-level aggregation builders
      * @param rowType the input row type for field resolution
      * @param typeFactory the type factory for creating aggregate return types
-     * @return metadata list, one per granularity (only levels with metrics or implicit count)
+     * @return granularity list, one per granularity (only levels with metrics or implicit count)
      * @throws ConversionException if any aggregation fails to convert
      */
-    public List<AggregationMetadata> walk(Collection<AggregationBuilder> aggs, RelDataType rowType, RelDataTypeFactory typeFactory)
+    public List<Granularity> walk(Collection<AggregationBuilder> aggs, RelDataType rowType, RelDataTypeFactory typeFactory)
         throws ConversionException {
         Map<String, AggregationMetadataBuilder> granularities = new LinkedHashMap<>();
         walkRecursive(aggs, new ArrayList<>(), granularities, rowType);
 
-        List<AggregationMetadata> result = new ArrayList<>();
-        for (AggregationMetadataBuilder builder : granularities.values()) {
+        List<Granularity> result = new ArrayList<>();
+        for (Map.Entry<String, AggregationMetadataBuilder> entry : granularities.entrySet()) {
+            AggregationMetadataBuilder builder = entry.getValue();
             if (builder.hasAggregateCalls()) {
-                result.add(builder.build(rowType, typeFactory));
+                result.add(new Granularity(entry.getKey(), builder.build(rowType, typeFactory)));
             }
         }
         return result;
@@ -127,7 +138,7 @@ public class AggregationTreeWalker {
         List<GroupingInfo> groupings,
         Map<String, AggregationMetadataBuilder> granularities
     ) {
-        String key = granularityKey(groupings);
+        String key = GranularityKeys.granularityKey(groupings);
         AggregationMetadataBuilder existing = granularities.get(key);
         if (existing != null) {
             return existing;
@@ -142,14 +153,5 @@ public class AggregationTreeWalker {
         }
         granularities.put(key, builder);
         return builder;
-    }
-
-    private static String granularityKey(List<GroupingInfo> groupings) {
-        if (groupings.isEmpty()) {
-            return "";
-        }
-        return IntStream.range(0, groupings.size())
-            .mapToObj(i -> i + ":" + String.join(",", groupings.get(i).getFieldNames()))
-            .collect(Collectors.joining("|"));
     }
 }

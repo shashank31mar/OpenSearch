@@ -28,23 +28,30 @@ public final class QueryPlans {
     }
 
     /**
-     * A single plan pairing a {@link Type} with a Calcite {@link RelNode}.
+     * A single plan pairing a {@link Type} with a Calcite {@link RelNode}, plus the granularity it
+     * populates.
+     *
+     * <p>A nested aggregation yields one plan per granularity level rather than one plan with child
+     * plans: {@code granularity} says which level a plan populates, and a parent level's key is a
+     * strict prefix of its children's, so nesting is recoverable from the keys alone.
      *
      * @param type what part of the response this plan produces
      * @param relNode the Calcite logical plan to execute
+     * @param granularity the granularity key identifying which aggregation level this plan populates;
+     *     {@code GranularityKeys.ROOT} for HITS plans and for a no-GROUP-BY aggregation
      */
-    // TODO: Nested aggregations may require multiple RelNodes per aggregation.
-    // Support linking child query plans for recursive nesting (e.g. nested sub-aggregations).
-    public record QueryPlan(Type type, RelNode relNode) {
+    public record QueryPlan(Type type, RelNode relNode, String granularity) {
         /**
          * Creates a query plan.
          *
          * @param type what part of the response this plan produces
          * @param relNode the Calcite logical plan to execute
+         * @param granularity the granularity key this plan populates, never null
          */
         public QueryPlan {
             Objects.requireNonNull(type, "type must not be null");
             Objects.requireNonNull(relNode, "relNode must not be null");
+            Objects.requireNonNull(granularity, "granularity must not be null");
         }
 
         /** Returns what part of the response this plan produces. */
@@ -57,6 +64,12 @@ public final class QueryPlans {
         @Override
         public RelNode relNode() {
             return relNode;
+        }
+
+        /** Returns the granularity key this plan populates. */
+        @Override
+        public String granularity() {
+            return granularity;
         }
     }
 

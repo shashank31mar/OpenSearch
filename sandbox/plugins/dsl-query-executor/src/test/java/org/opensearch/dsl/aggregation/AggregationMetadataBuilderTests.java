@@ -22,7 +22,7 @@ public class AggregationMetadataBuilderTests extends OpenSearchTestCase {
     public void testResolvesFieldGroupingToCorrectIndex() throws ConversionException {
         AggregationMetadataBuilder builder = new AggregationMetadataBuilder();
         // brand is the 3rd field (index 2) in TestUtils schema: name, price, brand, rating
-        builder.addGrouping(new FieldGrouping(List.of("brand")));
+        builder.addGrouping(new FieldGrouping("by_brand", List.of("brand")));
         builder.requestImplicitCount();
 
         AggregationMetadata metadata = builder.build(ctx.getRowType(), ctx.getCluster().getTypeFactory());
@@ -33,8 +33,8 @@ public class AggregationMetadataBuilderTests extends OpenSearchTestCase {
 
     public void testResolvesMultipleFieldGroupings() throws ConversionException {
         AggregationMetadataBuilder builder = new AggregationMetadataBuilder();
-        builder.addGrouping(new FieldGrouping(List.of("brand")));
-        builder.addGrouping(new FieldGrouping(List.of("name")));
+        builder.addGrouping(new FieldGrouping("by_brand", List.of("brand")));
+        builder.addGrouping(new FieldGrouping("by_name", List.of("name")));
         builder.requestImplicitCount();
 
         AggregationMetadata metadata = builder.build(ctx.getRowType(), ctx.getCluster().getTypeFactory());
@@ -46,7 +46,7 @@ public class AggregationMetadataBuilderTests extends OpenSearchTestCase {
 
     public void testThrowsForUnknownField() {
         AggregationMetadataBuilder builder = new AggregationMetadataBuilder();
-        builder.addGrouping(new FieldGrouping(List.of("nonexistent")));
+        builder.addGrouping(new FieldGrouping("by_missing", List.of("nonexistent")));
         builder.requestImplicitCount();
 
         expectThrows(ConversionException.class, () -> builder.build(ctx.getRowType(), ctx.getCluster().getTypeFactory()));

@@ -25,6 +25,7 @@ import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.opensearch.dsl.aggregation.AggregationMetadata;
 import org.opensearch.dsl.aggregation.AggregationRegistryFactory;
 import org.opensearch.dsl.aggregation.AggregationTreeWalker;
+import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.dsl.query.QueryRegistryFactory;
 import org.opensearch.search.SearchService;
@@ -111,21 +112,22 @@ public class SearchSourceConverter {
         if (size > 0) {
             RelNode hits = projectConverter.convert(base, ctx);
             hits = sortConverter.convert(hits, ctx);
-            builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, hits));
+            builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, hits, GranularityKeys.ROOT));
         }
 
         // Aggregation path: Scan → Filter → Aggregate → PostAggregate (one per granularity level)
         if (hasAggs) {
-            List<AggregationMetadata> metadataList = treeWalker.walk(
+            List<AggregationTreeWalker.Granularity> granularities = treeWalker.walk(
                 searchSource.aggregations().getAggregatorFactories(),
                 table.getRowType(),
                 cluster.getTypeFactory()
             );
-            for (AggregationMetadata metadata : metadataList) {
+            for (AggregationTreeWalker.Granularity granularity : granularities) {
+                AggregationMetadata metadata = granularity.metadata();
                 ConversionContext aggCtx = ctx.withAggregationMetadata(metadata);
                 RelNode aggs = aggConverter.convert(base, metadata);
                 aggs = postAggConverter.convert(aggs, aggCtx);
-                builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, aggs));
+                builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, aggs, granularity.key()));
             }
         }
 
