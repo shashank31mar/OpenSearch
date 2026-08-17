@@ -18,7 +18,6 @@ import org.apache.calcite.prepare.CalciteCatalogReader;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
-import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
@@ -66,7 +65,11 @@ public class SearchSourceConverter {
         // it is built per emitted plan in newBase(). Sharing the RexBuilder shares the type factory
         // into each per-plan cluster (RelOptCluster.create derives it from rexBuilder), which keeps
         // RelDataType instances interned across plans; every RexBuilder field is final.
-        this.typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
+        // DslTypeSystem, not RelDataTypeSystem.DEFAULT: the engine reduces this plan's AVG/STDDEV/VAR
+        // into rule-generated SUM calls that infer their type through this factory's type system, and
+        // the default one declares a sum as narrow as its input where the backend accumulates wider.
+        // That disagreement is invisible on one shard and fails the query on two. See DslTypeSystem.
+        this.typeFactory = new SqlTypeFactoryImpl(DslTypeSystem.INSTANCE);
         this.rexBuilder = new RexBuilder(typeFactory);
 
         CalciteSchema rootSchema = CalciteSchema.from(schema);

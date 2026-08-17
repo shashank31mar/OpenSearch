@@ -22,8 +22,13 @@ import org.opensearch.analytics.QueryRequestContext;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
+import org.opensearch.dsl.settings.DslGateInputs;
+import org.opensearch.dsl.settings.DslQuerySettings;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -32,6 +37,8 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -75,7 +82,7 @@ public class TransportDslExecuteActionTests extends OpenSearchTestCase {
     }
 
     public void testDoExecuteFailsWhenIndexNotInClusterState() {
-        ClusterService clusterService = mock(ClusterService.class);
+        ClusterService clusterService = clusterService();
         when(clusterService.state()).thenReturn(mock(ClusterState.class));
 
         IndexNameExpressionResolver resolver = mock(IndexNameExpressionResolver.class);
@@ -88,7 +95,9 @@ public class TransportDslExecuteActionTests extends OpenSearchTestCase {
             (plan, ctx, l) -> l.onResponse(Collections.emptyList()),
             clusterService,
             resolver,
-            mockThreadPool()
+            mockThreadPool(),
+            new DslQuerySettings(clusterService),
+            new DslGateInputs(clusterService.getClusterSettings())
         );
 
         TestListener listener = executeWith(action, "bogus-index");
@@ -108,7 +117,7 @@ public class TransportDslExecuteActionTests extends OpenSearchTestCase {
     }
 
     private TransportDslExecuteAction createAction(Index... resolvedIndices) {
-        ClusterService clusterService = mock(ClusterService.class);
+        ClusterService clusterService = clusterService();
         when(clusterService.state()).thenReturn(mock(ClusterState.class));
 
         IndexNameExpressionResolver resolver = mock(IndexNameExpressionResolver.class);
@@ -121,7 +130,9 @@ public class TransportDslExecuteActionTests extends OpenSearchTestCase {
             (plan, ctx, l) -> l.onResponse(Collections.emptyList()),
             clusterService,
             resolver,
-            mockThreadPool()
+            mockThreadPool(),
+            new DslQuerySettings(clusterService),
+            new DslGateInputs(clusterService.getClusterSettings())
         );
     }
 
@@ -139,6 +150,20 @@ public class TransportDslExecuteActionTests extends OpenSearchTestCase {
             }
         });
         return schema;
+    }
+
+    /**
+     * A mock cluster service with the settings surface both DSL settings holders read at construction:
+     * {@code DslQuerySettings} takes its initial value from the node settings and registers an update
+     * consumer on the registry, and {@code DslGateInputs} reads the registry per call.
+     */
+    private static ClusterService clusterService() {
+        ClusterService clusterService = mock(ClusterService.class);
+        Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        registered.addAll(DslQuerySettings.all());
+        when(clusterService.getSettings()).thenReturn(Settings.EMPTY);
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(Settings.EMPTY, registered));
+        return clusterService;
     }
 
     private static ThreadPool mockThreadPool() {

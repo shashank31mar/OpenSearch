@@ -161,10 +161,7 @@ public class DslQueryExecutorPluginTests extends OpenSearchTestCase {
         // The accepted leg, so the test cannot pass against a registry that rejects everything. The base
         // plugin's intercept gate rides along to prove the merged getSettings() keeps both keys valid.
         registered.validate(
-            Settings.builder()
-                .put("dsl.query.max_parallel_sub_plans", 2)
-                .put("dsl.query_executor.intercept_search.enabled", true)
-                .build(),
+            Settings.builder().put("dsl.query.max_parallel_sub_plans", 2).put("dsl.query_executor.intercept_search.enabled", true).build(),
             true
         );
     }

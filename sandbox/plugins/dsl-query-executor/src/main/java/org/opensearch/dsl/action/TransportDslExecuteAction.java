@@ -17,6 +17,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.analytics.EngineContextProvider;
 import org.opensearch.analytics.exec.QueryPlanExecutor;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -26,6 +27,8 @@ import org.opensearch.dsl.converter.SearchSourceConverter;
 import org.opensearch.dsl.executor.DslQueryPlanExecutor;
 import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.dsl.result.SearchResponseBuilder;
+import org.opensearch.dsl.settings.DslGateInputs;
+import org.opensearch.dsl.settings.DslQuerySettings;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -56,6 +59,9 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
      * @param executor analytics engine plan executor
      * @param clusterService cluster service for resolving index aliases
      * @param indexNameExpressionResolver resolves aliases and wildcards to concrete indices
+     * @param threadPool the node's thread pool
+     * @param dslSettings holder of the DSL operator knobs, including the fan-out width setting
+     * @param gateInputs reader for the cross-plugin inputs the fan-out width needs
      */
     @Inject
     public TransportDslExecuteAction(
@@ -65,11 +71,13 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
         QueryPlanExecutor<RelNode, Iterable<Object[]>> executor,
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        DslQuerySettings dslSettings,
+        DslGateInputs gateInputs
     ) {
         super(DslExecuteAction.NAME, transportService, actionFilters, SearchRequest::new);
         this.contextProvider = contextProvider;
-        this.planExecutor = new DslQueryPlanExecutor(executor);
+        this.planExecutor = new DslQueryPlanExecutor(executor, clusterService, threadPool, dslSettings, gateInputs);
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.threadPool = threadPool;
@@ -80,8 +88,18 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
         threadPool.executor(ThreadPool.Names.SEARCH).execute(() -> {
             final QueryPlans plans;
             final long convertTime;
+            // Both threaded to the plan executor, which needs the resolved name and the routing table to
+            // read the index's shard layout for the fan-out width. Resolved exactly once, here: a second
+            // resolution of one request can disagree with this one.
+            final String concreteIndex;
+            final ClusterState state;
             try {
-                String indexName = resolveToSingleIndex(request);
+                // ONE cluster-state read per request, handed to index resolution and to the fan-out width
+                // decision alike. Two reads is a TOCTOU: the width could be decided against a routing
+                // table that never coexisted with the one the plans were resolved against.
+                state = clusterService.state();
+                String indexName = resolveToSingleIndex(state, request);
+                concreteIndex = indexName;
                 long convertStart = System.nanoTime();
                 SearchSourceConverter converter = new SearchSourceConverter(contextProvider.getContext().schema());
                 plans = converter.convert(request.source(), indexName);
@@ -91,7 +109,7 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
                 listener.onFailure(e);
                 return;
             }
-            planExecutor.execute(plans, ActionListener.wrap(results -> {
+            planExecutor.execute(plans, state, concreteIndex, ActionListener.wrap(results -> {
                 final SearchResponse response;
                 try {
                     response = SearchResponseBuilder.build(results, convertTime);
@@ -114,9 +132,13 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
     /**
      * Resolves the request's indices (which may be aliases or wildcards) to a single concrete index.
      * Throws if the resolution yields zero or more than one concrete index.
+     *
+     * <p>Takes the snapshot rather than reading {@code clusterService.state()} itself: the caller has
+     * already read it once for the whole request, and this name has to describe the same routing table
+     * the fan-out width is later decided against.
      */
-    private String resolveToSingleIndex(SearchRequest request) {
-        Index[] concreteIndices = indexNameExpressionResolver.concreteIndices(clusterService.state(), request);
+    private String resolveToSingleIndex(ClusterState state, SearchRequest request) {
+        Index[] concreteIndices = indexNameExpressionResolver.concreteIndices(state, request);
         if (concreteIndices.length != 1) {
             throw new IllegalArgumentException(
                 "DSL execution currently supports exactly one concrete index, but resolved to " + concreteIndices.length + " indices"
