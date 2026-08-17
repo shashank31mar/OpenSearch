@@ -18,27 +18,34 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * Integration tests for DSL query conversion (filter path).
  * Uses various query types; sort and projection use defaults.
  */
-@AwaitsFix(bugUrl = "analytics engine pipeline not E2E complete: fragment conversion + shard execution + Arrow Flight drain not yet wired")
+@AwaitsFix(bugUrl = "this source set cannot start a node: AnalyticsPlugin.createComponents:168 throws"
+    + " \"ArrowNativeAllocator not available; arrow-base plugin must be installed\" because"
+    + " DslIntegTestBase.nodePlugins installs neither arrow-base nor arrow-flight-rpc, and even"
+    + " with those it has no execution backend (see build.gradle: the internalClusterTest block"
+    + " is analytics-engine-coordinator's minus the DataFusion native library). Response"
+    + " assembly is no longer the blocker; the test HOST is. Un-disabling needs this host"
+    + " brought up to sandbox/qa/analytics-engine-coordinator's plugin set + feature flags, or"
+    + " these cases moved to the REST host that installs real plugin zips.")
 public class DslQueryIT extends DslIntegTestBase {
 
     public void testNoQuery() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder()));
+        assertHasHits(search(new SearchSourceBuilder()));
     }
 
     public void testMatchAll() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().query(QueryBuilders.matchAllQuery())));
+        assertHasHits(search(new SearchSourceBuilder().query(QueryBuilders.matchAllQuery())));
     }
 
     public void testTermQuery() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().query(QueryBuilders.termQuery("name", "laptop"))));
+        assertHasHits(search(new SearchSourceBuilder().query(QueryBuilders.termQuery("name", "laptop"))));
     }
 
     public void testTermsQuery() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().query(QueryBuilders.termsQuery("name", "laptop", "phone"))));
+        assertHasHits(search(new SearchSourceBuilder().query(QueryBuilders.termsQuery("name", "laptop", "phone"))));
     }
 
     public void testTermsQueryWithBoostThrowsException() {
@@ -95,7 +102,7 @@ public class DslQueryIT extends DslIntegTestBase {
 
     public void testExistsQuery() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().query(QueryBuilders.existsQuery("name"))));
+        assertHasHits(search(new SearchSourceBuilder().query(QueryBuilders.existsQuery("name"))));
     }
 
     public void testExistsQueryWithBoostFails() {

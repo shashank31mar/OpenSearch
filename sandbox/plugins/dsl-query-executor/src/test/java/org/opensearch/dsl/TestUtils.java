@@ -10,11 +10,14 @@ package org.opensearch.dsl;
 
 import org.apache.calcite.config.CalciteConnectionConfigImpl;
 import org.apache.calcite.jdbc.CalciteSchema;
+import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.prepare.CalciteCatalogReader;
+import org.apache.calcite.rel.AbstractRelNode;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -51,6 +54,27 @@ public class TestUtils {
     public static LogicalTableScan createTestRelNode() {
         Infra infra = buildInfra();
         return LogicalTableScan.create(infra.cluster, infra.table, List.of());
+    }
+
+    /**
+     * A {@link RelNode} whose row type is exactly the given columns — a stand-in for an executed plan on
+     * the response-assembly path, where all that matters about a plan is the column names its rows carry.
+     *
+     * <p>Deliberately an {@link AbstractRelNode} rather than a {@code LogicalValues}: the Calcite factory
+     * methods route through {@code cluster.getMetadataQuery()}, which is exactly the thing assembly must
+     * never touch, so building the fixture must not depend on it either.
+     *
+     * @param columnNames the row type's field names, in order
+     * @return a plan node reporting that row type
+     */
+    public static RelNode createRelNodeWithColumns(List<String> columnNames) {
+        Infra infra = buildInfra();
+        RelDataTypeFactory typeFactory = infra.cluster.getTypeFactory();
+        RelDataTypeFactory.Builder rowType = typeFactory.builder();
+        for (String columnName : columnNames) {
+            rowType.add(columnName, typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.ANY), true));
+        }
+        return new FixedRowTypeRel(infra.cluster, rowType.build());
     }
 
     /** Creates a ConversionContext with the given search source and standard test schema. */
@@ -110,5 +134,21 @@ public class TestUtils {
     }
 
     private record Infra(RelOptCluster cluster, RelOptTable table) {
+    }
+
+    /** A plan node that reports a fixed row type and nothing else. See {@link #createRelNodeWithColumns}. */
+    private static final class FixedRowTypeRel extends AbstractRelNode {
+
+        private final RelDataType fixedRowType;
+
+        FixedRowTypeRel(RelOptCluster cluster, RelDataType fixedRowType) {
+            super(cluster, cluster.traitSetOf(Convention.NONE));
+            this.fixedRowType = fixedRowType;
+        }
+
+        @Override
+        protected RelDataType deriveRowType() {
+            return fixedRowType;
+        }
     }
 }

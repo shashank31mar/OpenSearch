@@ -1,5 +1,5 @@
 {
-  "testName": "terms_with_avg_aggregation",
+  "testName": "sibling_terms_same_field_aggregation",
   "indexName": "test-index",
   "indexMapping": {
     "name": "VARCHAR",
@@ -11,7 +11,7 @@
   "inputDsl": {
     "size": 0,
     "aggregations": {
-      "by_brand": {
+      "a": {
         "terms": {
           "field": "brand"
         },
@@ -19,6 +19,18 @@
           "avg_price": {
             "avg": {
               "field": "price"
+            }
+          }
+        }
+      },
+      "b": {
+        "terms": {
+          "field": "brand"
+        },
+        "aggregations": {
+          "total_rating": {
+            "sum": {
+              "field": "rating"
             }
           }
         }
@@ -31,9 +43,15 @@
     "    LogicalTableScan(table=[[test-index]])"
   ],
   "mockResultFieldNames": ["brand", "avg_price", "_count"],
-  "mockResultRows": [
-    ["BrandA", 850.0, 3],
-    ["BrandB", 1100.0, 2]
+  "mockResultRowsPerPlan": [
+    [
+      ["BrandA", 850.0, 3],
+      ["BrandB", 1100.0, 2]
+    ],
+    [
+      ["BrandA", 13.5, 3],
+      ["BrandB", 8.4, 2]
+    ]
   ],
   "expectedOutputDsl": {
     "num_reduce_phases": 0,
@@ -46,7 +64,7 @@
       "hits": []
     },
     "aggregations": {
-      "by_brand": {
+      "a": {
         "doc_count_error_upper_bound": 0,
         "sum_other_doc_count": 0,
         "buckets": [
@@ -62,6 +80,26 @@
             "doc_count": 2,
             "avg_price": {
               "value": 1100.0
+            }
+          }
+        ]
+      },
+      "b": {
+        "doc_count_error_upper_bound": 0,
+        "sum_other_doc_count": 0,
+        "buckets": [
+          {
+            "key": "BrandA",
+            "doc_count": 3,
+            "total_rating": {
+              "value": 13.5
+            }
+          },
+          {
+            "key": "BrandB",
+            "doc_count": 2,
+            "total_rating": {
+              "value": 8.4
             }
           }
         ]

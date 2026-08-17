@@ -10,6 +10,9 @@ package org.opensearch.dsl.aggregation.metric;
 
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.metrics.InternalSum;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
 
 /** Translates SUM metric aggregation to Calcite. */
@@ -31,5 +34,13 @@ public class SumMetricTranslator extends AbstractMetricTranslator<SumAggregation
     @Override
     protected String getFieldName(SumAggregationBuilder agg) {
         return agg.field();
+    }
+
+    @Override
+    public InternalAggregation toInternalAggregation(String name, Object value) {
+        Double sum = asDoubleOrNull(value);
+        // SumAggregator.buildEmptyAggregation: the sum of nothing is 0.0, and OpenSearch renders it as
+        // 0.0 rather than null. That is this metric's empty convention, not a fabricated value.
+        return new InternalSum(name, sum == null ? 0.0 : sum, DocValueFormat.RAW, null);
     }
 }

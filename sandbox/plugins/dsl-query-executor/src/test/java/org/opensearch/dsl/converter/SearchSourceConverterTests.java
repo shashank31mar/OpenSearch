@@ -39,6 +39,7 @@ import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
+import org.opensearch.search.aggregations.pipeline.MaxBucketPipelineAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -236,6 +237,49 @@ public class SearchSourceConverterTests extends OpenSearchTestCase {
         List<QueryPlans.QueryPlan> aggPlans = plans.get(QueryPlans.Type.AGGREGATION);
         assertEquals(2, aggPlans.size());
         assertNotEquals(aggPlans.get(0).granularity(), aggPlans.get(1).granularity());
+    }
+
+    // ---- Pipeline aggregations: rejected, never silently dropped ----
+
+    public void testPipelineAggregationIsRejected() {
+        // A pipeline aggregation lives in a sibling list the walker never reads, so it used to produce no
+        // plan and no error: the response came back without it. Now that assembly renders the real
+        // aggregations section, that would be a plausible-looking response with the requested
+        // aggregation simply missing.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .aggregation(
+                new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+            )
+            .aggregation(new MaxBucketPipelineAggregationBuilder("max_avg", "by_brand>avg_price"));
+
+        ConversionException e = expectThrows(ConversionException.class, () -> converter.convert(source, "test-index"));
+        assertThat(e.getMessage(), containsString("max_avg"));
+        assertThat(e.getMessage(), containsString("max_bucket"));
+    }
+
+    public void testNestedPipelineAggregationIsRejected() {
+        // Nested is the harder half: the top-level list is clean, so only a descent into each
+        // sub-aggregation's own pipeline list catches it.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .aggregation(
+                new TermsAggregationBuilder("by_brand").field("brand")
+                    .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                    .subAggregation(new MaxBucketPipelineAggregationBuilder("max_avg", "avg_price"))
+            );
+
+        ConversionException e = expectThrows(ConversionException.class, () -> converter.convert(source, "test-index"));
+        assertThat(e.getMessage(), containsString("max_avg"));
+    }
+
+    public void testPipelineAggregationAloneIsRejectedRatherThanAnsweredAsAHitsQuery() {
+        // With no ordinary aggregation beside it, getAggregatorFactories() is empty, so the aggregation
+        // path is skipped entirely and the request would have been answered as a plain hits query.
+        SearchSourceBuilder source = new SearchSourceBuilder().aggregation(
+            new MaxBucketPipelineAggregationBuilder("max_avg", "by_brand>avg_price")
+        );
+
+        ConversionException e = expectThrows(ConversionException.class, () -> converter.convert(source, "test-index"));
+        assertThat(e.getMessage(), containsString("max_avg"));
     }
 
     // ---- Per-plan planning isolation (SC-5) ----

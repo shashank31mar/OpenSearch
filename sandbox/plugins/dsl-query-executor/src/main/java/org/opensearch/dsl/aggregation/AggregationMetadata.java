@@ -21,8 +21,17 @@ import java.util.List;
  * <p>A multi-level aggregation tree (e.g., terms → terms → avg) produces
  * multiple metadata instances — one per distinct GROUP BY key set.
  *
- * <p>TODO: Add tree structure (parent-child links between granularity levels) and pipeline
- * aggregation support.
+ * <p>Parent-child links between granularity levels are deliberately <em>not</em> modelled here.
+ * Nesting is recovered from the granularity key instead: a parent level's key is a strict prefix of
+ * every descendant's, so {@link GranularityKeys#isAncestorKey} and
+ * {@link GranularityKeys#directChildrenOf} rebuild the tree on the response side without this class.
+ * The prefix property holds by construction — {@code AggregationTreeWalker.handleBucket} appends to a
+ * copied path — and holds for every aggregation buildable today, since the terms translator is the only
+ * registered bucket translator. Putting real links here instead would change the walker's data model and
+ * every metadata consumer, to buy a shape no code currently produces. A non-prefix granularity shape
+ * (pipeline aggregations, {@code filters}) is what would reopen the decision.
+ *
+ * <p>TODO: pipeline aggregation support.
  */
 public class AggregationMetadata {
 

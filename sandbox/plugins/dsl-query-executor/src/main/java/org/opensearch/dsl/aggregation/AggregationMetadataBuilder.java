@@ -21,7 +21,9 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalOrder;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Mutable builder for {@link AggregationMetadata}. Used by {@link AggregationTreeWalker}
@@ -151,7 +153,53 @@ public class AggregationMetadataBuilder {
             allFieldNames.add(IMPLICIT_COUNT_NAME);
         }
 
+        rejectColumnNameCollisions(allGroupFieldNames, allFieldNames);
         return new AggregationMetadata(ImmutableBitSet.of(allGroupIndices), allGroupFieldNames, allCalls, allFieldNames, bucketOrders);
+    }
+
+    /**
+     * Rejects a granularity whose output column names are ambiguous.
+     *
+     * <p>The response assembler resolves every column of an aggregate row <b>by name</b> — the bucket keys
+     * from the group-by field names, each metric from its aggregation name, and {@code doc_count} from
+     * {@link #IMPLICIT_COUNT_NAME}. That is only sound while those names are distinct. An aggregation named
+     * exactly {@code _count} (legal: {@code AggregatorFactories.VALID_AGG_NAME} only excludes {@code [},
+     * {@code ]} and {@code >}) or named after one of this level's grouping fields makes two roles claim one
+     * name, and the response would carry a silently wrong number — a bucket's {@code doc_count} reporting a
+     * user metric, or a metric reporting the bucket key. Rejecting the request at conversion time is the
+     * honest answer for a request this path cannot serve; it is caught here rather than in the assembler
+     * because Calcite may uniquify a duplicate field name and hide the collision from the row type.
+     *
+     * <p>Repeated names <em>within</em> the group-by list are deliberately allowed: nesting two bucket
+     * aggregations on the same field is legal, the repeated grouping index collapses to one column, and
+     * every reference to that name resolves to the same value, so nothing is ambiguous.
+     *
+     * @param groupFieldNames this granularity's grouping field names, in column order
+     * @param aggregateNames this granularity's aggregate output names, implicit count included
+     * @throws ConversionException if an aggregate name collides with a grouping field or another aggregate
+     */
+    private static void rejectColumnNameCollisions(List<String> groupFieldNames, List<String> aggregateNames) throws ConversionException {
+        Set<String> groupNames = new HashSet<>(groupFieldNames);
+        Set<String> seenAggregateNames = new HashSet<>();
+        for (String name : aggregateNames) {
+            if (groupNames.contains(name)) {
+                throw new ConversionException(
+                    "Aggregation name '"
+                        + name
+                        + "' collides with group-by field '"
+                        + name
+                        + "' at the same aggregation level; response columns are resolved by name, so rename the aggregation"
+                );
+            }
+            if (seenAggregateNames.add(name) == false) {
+                throw new ConversionException(
+                    "Two aggregations at the same level are named '"
+                        + name
+                        + "'"
+                        + (IMPLICIT_COUNT_NAME.equals(name) ? " — '" + IMPLICIT_COUNT_NAME + "' is reserved for a bucket's doc_count" : "")
+                );
+            }
+        }
     }
 
     /**

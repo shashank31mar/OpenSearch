@@ -28,8 +28,11 @@ import org.opensearch.dsl.aggregation.GranularityKeys;
 import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.dsl.query.QueryRegistryFactory;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.PipelineAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
@@ -103,6 +106,10 @@ public class SearchSourceConverter {
         if (table == null) {
             throw new IllegalArgumentException("Index not found in schema: " + indexName);
         }
+
+        // Before a plan is emitted, because a pipeline aggregation produces none and would otherwise be
+        // answered rather than rejected. See rejectPipelineAggregations.
+        rejectPipelineAggregations(searchSource);
 
         int size = searchSource.size() != -1 ? searchSource.size() : SearchService.DEFAULT_SIZE;
         boolean hasAggs = hasAggregations(searchSource);
@@ -187,6 +194,55 @@ public class SearchSourceConverter {
      * @param base this plan's own {@code Scan → Filter} subtree
      */
     record PlanBase(ConversionContext ctx, RelNode base) {
+    }
+
+    /**
+     * Rejects a request carrying a pipeline aggregation at any level of its aggregation tree.
+     *
+     * <p>Pipeline aggregations live in a <em>sibling</em> list of the one the walker reads:
+     * {@code AggregatorFactories.Builder} keeps them in {@code getPipelineAggregatorFactories()} while
+     * {@link AggregationTreeWalker#walk} is handed {@code getAggregatorFactories()} only. So a pipeline
+     * aggregation reached no translator and raised no error — it simply produced no plan, and the response
+     * came back without it. That was invisible while {@code SearchResponseBuilder} discarded every result
+     * (the whole response was empty), but now that assembly renders the real {@code aggregations} section
+     * a dropped pipeline aggregation would render as a plausible-looking answer with the requested
+     * aggregation missing: a silently wrong response, which is the one outcome the assembly path refuses
+     * everywhere else (a duplicate, missing or undecodable granularity key all fail loudly).
+     *
+     * <p>This is the existing unsupported-aggregation rejection reaching a list it could not see, not a
+     * new feasibility classifier: {@code AggregationTreeWalker} already raises
+     * {@link ConversionException} for any {@code AggregationBuilder} with no registered translator, and
+     * no pipeline aggregation has one.
+     *
+     * @param searchSource the request body; a null body or a body with no aggregations has nothing to
+     *     reject, and the size read below is what reports a null body
+     * @throws ConversionException if any level of the aggregation tree carries a pipeline aggregation
+     */
+    private static void rejectPipelineAggregations(SearchSourceBuilder searchSource) throws ConversionException {
+        if (searchSource == null || searchSource.aggregations() == null) {
+            return;
+        }
+        rejectPipelineAggregations(
+            searchSource.aggregations().getAggregatorFactories(),
+            searchSource.aggregations().getPipelineAggregatorFactories()
+        );
+    }
+
+    /** Descends one level of the request tree: this level's pipeline aggregations, then each sub-tree. */
+    private static void rejectPipelineAggregations(Collection<AggregationBuilder> aggs, Collection<PipelineAggregationBuilder> pipelines)
+        throws ConversionException {
+        if (pipelines != null && pipelines.isEmpty() == false) {
+            PipelineAggregationBuilder pipeline = pipelines.iterator().next();
+            throw new ConversionException(
+                "Pipeline aggregation '" + pipeline.getName() + "' of type '" + pipeline.getType() + "' is not supported"
+            );
+        }
+        if (aggs == null) {
+            return;
+        }
+        for (AggregationBuilder agg : aggs) {
+            rejectPipelineAggregations(agg.getSubAggregations(), agg.getPipelineAggregations());
+        }
     }
 
     private static boolean hasAggregations(SearchSourceBuilder searchSource) {

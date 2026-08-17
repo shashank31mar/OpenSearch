@@ -28,6 +28,13 @@ public class GoldenTestCase {
     private List<String> expectedRelNodePlan;
     private List<String> mockResultFieldNames;
     private List<List<Object>> mockResultRows;
+    /**
+     * One row set per emitted plan of {@code planType}, aligned with the converter's plan order. Set this
+     * instead of {@code mockResultRows} for a shape that emits more than one plan — a nested aggregation or
+     * a same-field sibling pair — because response assembly needs every granularity's rows, not just the
+     * first plan's.
+     */
+    private List<List<List<Object>>> mockResultRowsPerPlan;
     private Map<String, Object> expectedOutputDsl;
     private String planType;
 
@@ -85,6 +92,14 @@ public class GoldenTestCase {
 
     public void setMockResultRows(List<List<Object>> mockResultRows) {
         this.mockResultRows = mockResultRows;
+    }
+
+    public List<List<List<Object>>> getMockResultRowsPerPlan() {
+        return mockResultRowsPerPlan;
+    }
+
+    public void setMockResultRowsPerPlan(List<List<List<Object>>> mockResultRowsPerPlan) {
+        this.mockResultRowsPerPlan = mockResultRowsPerPlan;
     }
 
     public Map<String, Object> getExpectedOutputDsl() {

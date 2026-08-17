@@ -84,7 +84,13 @@ public class GoldenFileLoader {
         requireNonNull(testCase.getInputDsl(), "inputDsl", filePath);
         requireNonNull(testCase.getExpectedRelNodePlan(), "expectedRelNodePlan", filePath);
         requireNonNull(testCase.getMockResultFieldNames(), "mockResultFieldNames", filePath);
-        requireNonNull(testCase.getMockResultRows(), "mockResultRows", filePath);
+        // A shape that emits several plans supplies one row set per plan instead of a single one; exactly
+        // one of the two has to be there, or the case has no rows to assemble from.
+        if (testCase.getMockResultRows() == null && testCase.getMockResultRowsPerPlan() == null) {
+            throw new IllegalArgumentException(
+                "Golden file " + filePath + " missing required field: mockResultRows (or mockResultRowsPerPlan)"
+            );
+        }
         requireNonNull(testCase.getExpectedOutputDsl(), "expectedOutputDsl", filePath);
         requireNonNull(testCase.getPlanType(), "planType", filePath);
         try {

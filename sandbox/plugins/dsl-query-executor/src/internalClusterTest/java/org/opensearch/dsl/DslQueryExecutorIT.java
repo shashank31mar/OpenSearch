@@ -24,7 +24,14 @@ import java.util.List;
  * Integration test that verifies the full DSL query execution pipeline:
  * SearchActionFilter → TransportDslExecuteAction → SearchSourceConverter → DslQueryPlanExecutor → SearchResponse.
  */
-@AwaitsFix(bugUrl = "analytics engine pipeline not E2E complete: fragment conversion + shard execution + Arrow Flight drain not yet wired")
+@AwaitsFix(bugUrl = "this source set cannot start a node: AnalyticsPlugin.createComponents:168 throws"
+    + " \"ArrowNativeAllocator not available; arrow-base plugin must be installed\" because"
+    + " DslIntegTestBase.nodePlugins installs neither arrow-base nor arrow-flight-rpc, and even"
+    + " with those it has no execution backend (see build.gradle: the internalClusterTest block"
+    + " is analytics-engine-coordinator's minus the DataFusion native library). Response"
+    + " assembly is no longer the blocker; the test HOST is. Un-disabling needs this host"
+    + " brought up to sandbox/qa/analytics-engine-coordinator's plugin set + feature flags, or"
+    + " these cases moved to the REST host that installs real plugin zips.")
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.SUITE, numDataNodes = 1)
 public class DslQueryExecutorIT extends OpenSearchIntegTestCase {
 

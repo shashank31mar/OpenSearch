@@ -112,7 +112,7 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
             planExecutor.execute(plans, state, concreteIndex, ActionListener.wrap(results -> {
                 final SearchResponse response;
                 try {
-                    response = SearchResponseBuilder.build(results, convertTime);
+                    response = SearchResponseBuilder.build(results, request.source(), convertTime);
                 } catch (Exception buildEx) {
                     logger.error("DSL response building failed", buildEx);
                     listener.onFailure(buildEx);

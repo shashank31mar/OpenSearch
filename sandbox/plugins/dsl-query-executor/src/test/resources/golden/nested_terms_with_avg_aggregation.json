@@ -1,0 +1,112 @@
+{
+  "testName": "nested_terms_with_avg_aggregation",
+  "indexName": "test-index",
+  "indexMapping": {
+    "name": "VARCHAR",
+    "price": "INTEGER",
+    "brand": "VARCHAR",
+    "category": "VARCHAR"
+  },
+  "planType": "AGGREGATION",
+  "inputDsl": {
+    "size": 0,
+    "aggregations": {
+      "by_brand": {
+        "terms": {
+          "field": "brand"
+        },
+        "aggregations": {
+          "by_category": {
+            "terms": {
+              "field": "category"
+            },
+            "aggregations": {
+              "avg_price": {
+                "avg": {
+                  "field": "price"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "expectedRelNodePlan": [
+    "LogicalSort(sort0=[$1], sort1=[$0], dir0=[DESC], dir1=[ASC])",
+    "  LogicalAggregate(group=[{2}], _count=[COUNT()])",
+    "    LogicalTableScan(table=[[test-index]])"
+  ],
+  "mockResultFieldNames": ["brand", "_count"],
+  "mockResultRowsPerPlan": [
+    [
+      ["BrandA", 3],
+      ["BrandB", 2]
+    ],
+    [
+      ["BrandA", "phone", 600.0, 2],
+      ["BrandA", "laptop", 250.0, 1],
+      ["BrandB", "phone", 1100.0, 2]
+    ]
+  ],
+  "expectedOutputDsl": {
+    "num_reduce_phases": 0,
+    "hits": {
+      "total": {
+        "value": 0,
+        "relation": "eq"
+      },
+      "max_score": 0.0,
+      "hits": []
+    },
+    "aggregations": {
+      "by_brand": {
+        "doc_count_error_upper_bound": 0,
+        "sum_other_doc_count": 0,
+        "buckets": [
+          {
+            "key": "BrandA",
+            "doc_count": 3,
+            "by_category": {
+              "doc_count_error_upper_bound": 0,
+              "sum_other_doc_count": 0,
+              "buckets": [
+                {
+                  "key": "phone",
+                  "doc_count": 2,
+                  "avg_price": {
+                    "value": 600.0
+                  }
+                },
+                {
+                  "key": "laptop",
+                  "doc_count": 1,
+                  "avg_price": {
+                    "value": 250.0
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": "BrandB",
+            "doc_count": 2,
+            "by_category": {
+              "doc_count_error_upper_bound": 0,
+              "sum_other_doc_count": 0,
+              "buckets": [
+                {
+                  "key": "phone",
+                  "doc_count": 2,
+                  "avg_price": {
+                    "value": 1100.0
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

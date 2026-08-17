@@ -18,7 +18,14 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * Integration tests for DSL aggregation conversion.
  * Uses matchAllQuery; focus is on aggregation plan building.
  */
-@AwaitsFix(bugUrl = "analytics engine pipeline not E2E complete: fragment conversion + shard execution + Arrow Flight drain not yet wired")
+@AwaitsFix(bugUrl = "this source set cannot start a node: AnalyticsPlugin.createComponents:168 throws"
+    + " \"ArrowNativeAllocator not available; arrow-base plugin must be installed\" because"
+    + " DslIntegTestBase.nodePlugins installs neither arrow-base nor arrow-flight-rpc, and even"
+    + " with those it has no execution backend (see build.gradle: the internalClusterTest block"
+    + " is analytics-engine-coordinator's minus the DataFusion native library). Response"
+    + " assembly is no longer the blocker; the test HOST is. Un-disabling needs this host"
+    + " brought up to sandbox/qa/analytics-engine-coordinator's plugin set + feature flags, or"
+    + " these cases moved to the REST host that installs real plugin zips.")
 public class DslAggregationIT extends DslIntegTestBase {
 
     public void testMetricOnly() {
@@ -41,25 +48,31 @@ public class DslAggregationIT extends DslIntegTestBase {
 
     public void testTermsBucket() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().size(0).aggregation(new TermsAggregationBuilder("by_brand").field("brand"))));
+        assertBucketCount(
+            search(new SearchSourceBuilder().size(0).aggregation(new TermsAggregationBuilder("by_brand").field("brand"))),
+            "by_brand",
+            1
+        );
     }
 
     public void testTermsBucketWithMetric() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(
                         new TermsAggregationBuilder("by_brand").field("brand")
                             .subAggregation(AggregationBuilders.avg("avg_price").field("price"))
                     )
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 
     public void testNestedBuckets() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(
@@ -70,49 +83,57 @@ public class DslAggregationIT extends DslIntegTestBase {
                                     .subAggregation(AggregationBuilders.avg("avg_price").field("price"))
                             )
                     )
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 
     public void testAggsWithHits() {
         createTestIndex();
         // size > 0 with aggs produces both HITS + AGGREGATION plans
-        assertOk(search(new SearchSourceBuilder().size(10).aggregation(AggregationBuilders.avg("avg_price").field("price"))));
+        assertHasHits(search(new SearchSourceBuilder().size(10).aggregation(AggregationBuilders.avg("avg_price").field("price"))));
     }
 
     public void testTermsBucketOrderByKeyAsc() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(new TermsAggregationBuilder("by_brand").field("brand").order(BucketOrder.key(true)))
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 
     public void testTermsBucketOrderByKeyDesc() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(new TermsAggregationBuilder("by_brand").field("brand").order(BucketOrder.key(false)))
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 
     public void testTermsBucketOrderByCountAsc() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(new TermsAggregationBuilder("by_brand").field("brand").order(BucketOrder.count(true)))
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 
     public void testTermsBucketOrderByMetric() {
         createTestIndex();
-        assertOk(
+        assertBucketCount(
             search(
                 new SearchSourceBuilder().size(0)
                     .aggregation(
@@ -120,7 +141,9 @@ public class DslAggregationIT extends DslIntegTestBase {
                             .order(BucketOrder.aggregation("avg_price", false))
                             .subAggregation(AggregationBuilders.avg("avg_price").field("price"))
                     )
-            )
+            ),
+            "by_brand",
+            1
         );
     }
 }

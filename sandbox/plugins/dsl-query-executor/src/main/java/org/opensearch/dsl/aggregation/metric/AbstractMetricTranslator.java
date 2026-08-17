@@ -67,9 +67,37 @@ public abstract class AbstractMetricTranslator<T extends AggregationBuilder> imp
         return agg.getName();
     }
 
-    // TODO: implement response conversion per metric type (InternalAvg, InternalSum, etc.)
+    /**
+     * Deliberately left abstract rather than given a throwing default: a fifth metric translator added
+     * without a response leaf must fail to compile, not ship an aggregation that throws at response
+     * time on a query the converter happily accepted.
+     */
     @Override
-    public InternalAggregation toInternalAggregation(String name, Object value) {
-        throw new UnsupportedOperationException("toInternalAggregation not yet implemented for " + getClass().getSimpleName());
+    public abstract InternalAggregation toInternalAggregation(String name, Object value);
+
+    /**
+     * Narrows a raw row value to a {@code double} for a single-value metric leaf.
+     *
+     * <p>The value's runtime type is the <em>input field's</em> type, not the metric's: Calcite pins the
+     * aggregate's return type to its argument's, so an {@code INTEGER} column yields {@code Integer} and
+     * a {@code BIGINT} one {@code Long} even under AVG. {@code null} is a legitimate value (a
+     * no-GROUP-BY metric over an empty result set), and each metric maps it to its own OpenSearch
+     * empty-metric convention rather than to {@code 0}.
+     *
+     * @param value the raw row value
+     * @return the value as a {@code Double}, or null if the value was null
+     * @throws IllegalStateException if the value is neither null nor a {@link Number} — a shape the
+     *     plan cannot produce, so failing the request beats rendering a fabricated number
+     */
+    protected static Double asDoubleOrNull(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        throw new IllegalStateException(
+            "Metric value must be a Number or null, but was " + value.getClass().getName() + " [" + value + "]"
+        );
     }
 }

@@ -25,11 +25,30 @@
     "num_reduce_phases": 0,
     "hits": {
       "total": {
-        "value": 0,
-        "relation": "eq"
+        "value": 2,
+        "relation": "gte"
       },
-      "max_score": 0.0,
-      "hits": []
+      "max_score": null,
+      "hits": [
+        {
+          "_score": null,
+          "_source": {
+            "name": "laptop",
+            "price": 999,
+            "brand": "BrandA",
+            "rating": 4.5
+          }
+        },
+        {
+          "_score": null,
+          "_source": {
+            "name": "phone",
+            "price": 699,
+            "brand": "BrandB",
+            "rating": 4.2
+          }
+        }
+      ]
     }
   }
 }

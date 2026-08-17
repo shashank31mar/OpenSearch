@@ -12,6 +12,8 @@ import org.opensearch.dsl.aggregation.bucket.BucketTranslator;
 import org.opensearch.dsl.aggregation.metric.MetricTranslator;
 import org.opensearch.search.aggregations.AggregationBuilder;
 
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -69,5 +71,16 @@ public class AggregationRegistry {
     public <T extends AggregationBuilder> BucketTranslator<T> getBucket(Class<? extends AggregationBuilder> aggClass) {
         AggregationTranslator<?> translator = translators.get(aggClass);
         return translator instanceof BucketTranslator ? (BucketTranslator<T>) translator : null;
+    }
+
+    /**
+     * Every registered translator. Exists so registry-wide invariants can be asserted over the real
+     * registered set rather than a hand-maintained list — a translator added to
+     * {@link AggregationRegistryFactory} without a response leaf has to be caught by something.
+     *
+     * @return an unmodifiable view of the registered translators
+     */
+    public Collection<AggregationTranslator<?>> all() {
+        return Collections.unmodifiableCollection(translators.values());
     }
 }

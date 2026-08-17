@@ -16,37 +16,44 @@ import org.opensearch.search.sort.SortOrder;
  * Integration tests for DSL sort and pagination conversion.
  * Uses matchAllQuery; focus is on sort/from/size behavior.
  */
-@AwaitsFix(bugUrl = "analytics engine pipeline not E2E complete: fragment conversion + shard execution + Arrow Flight drain not yet wired")
+@AwaitsFix(bugUrl = "this source set cannot start a node: AnalyticsPlugin.createComponents:168 throws"
+    + " \"ArrowNativeAllocator not available; arrow-base plugin must be installed\" because"
+    + " DslIntegTestBase.nodePlugins installs neither arrow-base nor arrow-flight-rpc, and even"
+    + " with those it has no execution backend (see build.gradle: the internalClusterTest block"
+    + " is analytics-engine-coordinator's minus the DataFusion native library). Response"
+    + " assembly is no longer the blocker; the test HOST is. Un-disabling needs this host"
+    + " brought up to sandbox/qa/analytics-engine-coordinator's plugin set + feature flags, or"
+    + " these cases moved to the REST host that installs real plugin zips.")
 public class DslSortIT extends DslIntegTestBase {
 
     public void testDefaultPagination() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder()));
+        assertHasHits(search(new SearchSourceBuilder()));
     }
 
     public void testSortAscending() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().sort("name", SortOrder.ASC)));
+        assertHasHits(search(new SearchSourceBuilder().sort("name", SortOrder.ASC)));
     }
 
     public void testSortDescending() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().sort("price", SortOrder.DESC)));
+        assertHasHits(search(new SearchSourceBuilder().sort("price", SortOrder.DESC)));
     }
 
     public void testMultipleSortFields() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().sort("brand", SortOrder.ASC).sort("price", SortOrder.DESC)));
+        assertHasHits(search(new SearchSourceBuilder().sort("brand", SortOrder.ASC).sort("price", SortOrder.DESC)));
     }
 
     public void testCustomSize() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().size(5)));
+        assertHasHits(search(new SearchSourceBuilder().size(5)));
     }
 
     public void testFromAndSize() {
         createTestIndex();
-        assertOk(search(new SearchSourceBuilder().from(0).size(5)));
+        assertHasHits(search(new SearchSourceBuilder().from(0).size(5)));
     }
 
     public void testFromOffset() {
