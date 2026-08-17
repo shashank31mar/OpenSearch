@@ -19,6 +19,8 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.dsl.action.DslExecuteAction;
 import org.opensearch.dsl.action.SearchActionFilter;
 import org.opensearch.dsl.action.TransportDslExecuteAction;
+import org.opensearch.dsl.settings.DslGateInputs;
+import org.opensearch.dsl.settings.DslQuerySettings;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.plugins.ActionPlugin;
@@ -30,18 +32,24 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.watcher.ResourceWatcherService;
 
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Plugin entry point. Registers {@link SearchActionFilter} to intercept _search requests
- * and {@link TransportDslExecuteAction} to handle DSL-to-Calcite conversion and execution.
+ * Plugin entry point. Registers {@link SearchActionFilter} to intercept _search requests,
+ * {@link TransportDslExecuteAction} to handle DSL-to-Calcite conversion and execution, the
+ * {@link DslQuerySettings} operator knobs, and {@link DslGateInputs}, the reader for the
+ * cross-plugin inputs the sub-plan fan-out decision needs.
  */
 public class DslQueryExecutorPlugin extends Plugin implements ActionPlugin {
 
     private SearchActionFilter searchActionFilter;
+    // Held as well as returned: the holder is a component (injected into TransportDslExecuteAction)
+    // and the field keeps it reachable for a later direct reader, the same way getActionFilters()
+    // below reads searchActionFilter.
+    private DslQuerySettings dslQuerySettings;
 
     /** Creates a new plugin instance. */
     public DslQueryExecutorPlugin() {}
@@ -60,13 +68,24 @@ public class DslQueryExecutorPlugin extends Plugin implements ActionPlugin {
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
+        // Base branch owns the interception gate (SearchActionFilter.INTERCEPT_SEARCH_ENABLED) —
+        // reused as-is; our duplicate dsl.query.enabled lever is deliberately NOT ported.
         this.searchActionFilter = new SearchActionFilter((NodeClient) client, clusterService);
-        return Collections.emptyList();
+        // Fan-out additions: the settings holder carries dsl.query.max_parallel_sub_plans, and
+        // DslGateInputs is the only production construction site of the cross-plugin gate-input reader.
+        this.dslQuerySettings = new DslQuerySettings(clusterService);
+        return List.of(dslQuerySettings, new DslGateInputs(clusterService.getClusterSettings()));
     }
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(SearchActionFilter.INTERCEPT_SEARCH_ENABLED);
+        // The plugin's own interception gate plus the fan-out width knob. Both have to be here or
+        // they are unsettable in opensearch.yml, a 400 on _cluster/settings, and unresolvable by key
+        // from a sibling plugin's classloader (which is how DslGateInputs reads across the boundary).
+        List<Setting<?>> settings = new ArrayList<>();
+        settings.add(SearchActionFilter.INTERCEPT_SEARCH_ENABLED);
+        settings.addAll(DslQuerySettings.all());
+        return List.copyOf(settings);
     }
 
     @Override

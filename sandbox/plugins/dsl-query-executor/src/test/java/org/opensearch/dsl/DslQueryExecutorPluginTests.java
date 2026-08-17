@@ -9,16 +9,29 @@
 package org.opensearch.dsl;
 
 import org.opensearch.action.support.ActionFilter;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsException;
+import org.opensearch.common.settings.SettingsModule;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.dsl.action.DslExecuteAction;
 import org.opensearch.dsl.action.SearchActionFilter;
 import org.opensearch.dsl.action.TransportDslExecuteAction;
+import org.opensearch.dsl.settings.DslGateInputs;
+import org.opensearch.dsl.settings.DslQuerySettings;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.client.node.NodeClient;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class DslQueryExecutorPluginTests extends OpenSearchTestCase {
 
@@ -37,11 +50,148 @@ public class DslQueryExecutorPluginTests extends OpenSearchTestCase {
     }
 
     public void testGetActionFiltersAfterCreateComponents() {
-        plugin.createComponents(mock(NodeClient.class), null, null, null, null, null, null, null, null, null, null);
+        createComponents();
 
         List<ActionFilter> filters = plugin.getActionFilters();
         assertEquals(1, filters.size());
         assertTrue(filters.get(0) instanceof SearchActionFilter);
+    }
+
+    /**
+     * A setting missing from {@code getSettings()} is invisible to {@code _cluster/settings} (a PUT of
+     * it is a 400) and not resolvable by key from another plugin's classloader.
+     */
+    public void testGetSettingsRegistersInterceptGateAndFanOutWidth() {
+        Set<String> keys = plugin.getSettings().stream().map(Setting::getKey).collect(Collectors.toSet());
+
+        assertEquals(Set.of("dsl.query_executor.intercept_search.enabled", "dsl.query.max_parallel_sub_plans"), keys);
+    }
+
+    /**
+     * Identity, not key equality. {@code Setting.equals} compares keys only, but
+     * {@code ClusterSettings.addSettingsUpdateConsumer} rejects any descriptor that is not the very
+     * instance the node registered (AbstractScopedSettings.java:256). So if {@code getSettings()} handed
+     * out key-equal copies instead of the constants the holders subscribe to, the node would register the
+     * copies and {@code DslQuerySettings}' or {@code SearchActionFilter}'s constructor would throw
+     * {@code SettingsException} — the plugin would fail to load. The key-set assertion above cannot see
+     * that; this can.
+     */
+    public void testGetSettingsRegistersTheSameDescriptorsTheHoldersSubscribeTo() {
+        List<Setting<?>> registered = plugin.getSettings();
+
+        assertEquals(
+            "getSettings() must register the intercept gate plus every setting all() declares",
+            DslQuerySettings.all().size() + 1,
+            registered.size()
+        );
+        // The intercept gate is the base plugin's own lever, subscribed to by SearchActionFilter's
+        // constructor. It is asserted here so that merging the fan-out width in cannot drop it.
+        assertSameDescriptorRegistered(registered, SearchActionFilter.INTERCEPT_SEARCH_ENABLED);
+        for (Setting<?> declared : DslQuerySettings.all()) {
+            assertSameDescriptorRegistered(registered, declared);
+        }
+    }
+
+    private static void assertSameDescriptorRegistered(List<Setting<?>> registered, Setting<?> declared) {
+        Setting<?> match = registered.stream().filter(s -> s.getKey().equals(declared.getKey())).findFirst().orElse(null);
+        assertNotNull("getSettings() does not register " + declared.getKey(), match);
+        assertSame("getSettings() must register the descriptor instance itself, not a key-equal copy", declared, match);
+    }
+
+    /**
+     * Both holders must be returned so Guice can inject them into the transport action: without the
+     * settings holder the execution path has no route to {@code dsl.query.max_parallel_sub_plans}, and
+     * without the gate-input reader the cross-plugin read path has no production construction site at
+     * all — it would be reachable only from hand-built test registries.
+     */
+    public void testCreateComponentsReturnsDslQuerySettingsAndGateInputs() {
+        Set<Class<?>> types = createComponents().stream().map(Object::getClass).collect(Collectors.toSet());
+
+        assertEquals(
+            "expected exactly the two settings components, got " + types,
+            Set.of(DslQuerySettings.class, DslGateInputs.class),
+            types
+        );
+    }
+
+    private Collection<Object> createComponents() {
+        // createComponents now dereferences clusterService to build the settings holder, so the
+        // previous null here would NPE. The constructor is deliberately not null-tolerant.
+        //
+        // The registry is built from plugin.getSettings() rather than DslQuerySettings.all() on purpose:
+        // that is what the node registers, so every createComponents test also proves the holder's
+        // addSettingsUpdateConsumer calls resolve against it. Were the two to drift, this would throw
+        // SettingsException here exactly as it would at node startup.
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.getSettings()).thenReturn(Settings.EMPTY);
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(Settings.EMPTY, Set.copyOf(plugin.getSettings())));
+        return plugin.createComponents(mock(NodeClient.class), clusterService, null, null, null, null, null, null, null, null, null);
+    }
+
+    /**
+     * The registration mechanism itself, exercised through the class a node builds its registry with.
+     * {@code SettingsModule} puts every {@code NodeScope} setting of every plugin into one map and builds
+     * the single {@code ClusterSettings} from it, which is what makes a key resolvable <i>by string</i>
+     * from any plugin — the same mechanism {@code DslGateInputs} depends on for the two foreign keys it
+     * reads, here proven for the two this plugin owns. Identity is asserted, not just presence: the
+     * registry has to hand back the very descriptor the holder subscribes to.
+     */
+    public void testSettingsModuleMakesBothDslKeysResolvableByString() {
+        ClusterSettings registered = nodeRegistry(plugin.getSettings());
+
+        assertSame(DslQuerySettings.MAX_PARALLEL_SUB_PLANS, registered.get("dsl.query.max_parallel_sub_plans"));
+        assertSame(SearchActionFilter.INTERCEPT_SEARCH_ENABLED, registered.get("dsl.query_executor.intercept_search.enabled"));
+    }
+
+    /**
+     * The cap at the layer a {@code _cluster/settings} PUT actually hits: the transport action validates
+     * the submitted settings against the node's registry before applying them, and that validation is
+     * what turns a {@code 3} into a 400. A cap enforced only by a downstream {@code min} passes
+     * {@code DslQuerySettingsTests} and fails here.
+     */
+    public void testSettingsModuleValidationRejectsThreeAndAcceptsTwo() {
+        ClusterSettings registered = nodeRegistry(plugin.getSettings());
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> registered.validate(Settings.builder().put("dsl.query.max_parallel_sub_plans", 3).build(), true)
+        );
+        assertTrue("expected an upper-bound message, got: " + e.getMessage(), e.getMessage().contains("must be <= 2"));
+
+        // The accepted leg, so the test cannot pass against a registry that rejects everything. The base
+        // plugin's intercept gate rides along to prove the merged getSettings() keeps both keys valid.
+        registered.validate(
+            Settings.builder()
+                .put("dsl.query.max_parallel_sub_plans", 2)
+                .put("dsl.query_executor.intercept_search.enabled", true)
+                .build(),
+            true
+        );
+    }
+
+    /**
+     * The other side of the same mechanism, and the reason the sweep harness is blocked until this
+     * plugin registers its settings: without {@code getSettings()} the key is not merely inert, it is
+     * <b>rejected</b> as unknown — a 400 over REST, a startup failure in {@code opensearch.yml}.
+     */
+    public void testKeysAreUnknownToANodeThatDoesNotRegisterThem() {
+        ClusterSettings withoutDslSettings = nodeRegistry(List.of());
+
+        // SettingsException, not IllegalArgumentException: an unregistered key is rejected before any
+        // value parsing happens. It carries RestStatus.BAD_REQUEST all the same, so the operator-visible
+        // outcome is the documented 400.
+        SettingsException e = expectThrows(
+            SettingsException.class,
+            () -> withoutDslSettings.validate(Settings.builder().put("dsl.query.max_parallel_sub_plans", 2).build(), true)
+        );
+        assertTrue("expected an unknown-setting message, got: " + e.getMessage(), e.getMessage().contains("unknown setting"));
+        assertEquals(RestStatus.BAD_REQUEST, e.status());
+        assertNull(withoutDslSettings.get("dsl.query_executor.intercept_search.enabled"));
+    }
+
+    /** The registry a node ends up with, assembled the way {@code Node} assembles it. */
+    private static ClusterSettings nodeRegistry(List<Setting<?>> pluginSettings) {
+        return new SettingsModule(Settings.EMPTY, pluginSettings, List.of(), Set.of()).getClusterSettings();
     }
 
     public void testRegistersTransportAction() {

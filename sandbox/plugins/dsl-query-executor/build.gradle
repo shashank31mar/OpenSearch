@@ -39,6 +39,17 @@ dependencies {
   calciteCompile "com.google.guava:guava:${versions.guava}"
 
   testImplementation project(':test:framework')
+  // TEST SCOPE ONLY — TargetPartitionsDriftTests pins DslGateInputs' local target_partitions
+  // mirror against the real DatafusionSettings derivation. Promoting this to compileOnly or
+  // implementation would let src/main import the sibling backend's classes, which do not resolve
+  // through this plugin's runtime classloader (both declare extendedPlugins = ['analytics-engine'],
+  // so they are siblings, not parent/child).
+  testImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+  // TEST SCOPE ONLY — GateInputKeyDriftTests pins DslGateInputs' two untyped-by-key reads against the
+  // real descriptors their owners declare. This plugin is already a compileOnly dependency (parent via
+  // extendedPlugins), so unlike the sibling backend above this line adds no classloader exposure; it is
+  // here so the drift test can reach AnalyticsQuerySettings, which src/main must keep not referencing.
+  testImplementation project(':sandbox:plugins:analytics-engine')
   testImplementation "org.mockito:mockito-core:${versions.mockito}"
   testImplementation "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
   testImplementation "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
