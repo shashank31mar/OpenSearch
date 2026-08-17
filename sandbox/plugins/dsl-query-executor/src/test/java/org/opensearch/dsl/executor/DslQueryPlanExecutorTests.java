@@ -830,6 +830,71 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
     }
 
     /**
+     * The flat arm's payload contract under <b>real</b> concurrency — the analogue of
+     * {@link #testConcurrentCompletionsSlotEveryPlanExactlyOnce()}, and the one that matters most for a
+     * measurement tool: a racy flat launch would produce fast numbers that are quietly wrong, which is worse
+     * than no flat launch at all. Every other flat test here completes the parked plans from the test
+     * thread, so the gate's release and the collector's slotting are never actually concurrent there.
+     *
+     * <p>Run at the widest flat fan-out the inline-drain bound allows ({@code n == MAX_FANOUT_PLANS}, all of
+     * them gated), with more drainers than permits so two releases overlap inside the gate. It pins that
+     * every plan's payload lands in its own slot (nothing lost, duplicated or reordered), that the terminal
+     * fires exactly once, and that concurrent releases cannot admit a plan past {@code K_eff} — including
+     * for plan 0, which under this arm is a gated plan like any other. Run with {@code -Dtests.iters=100}.
+     */
+    public void testFlatConcurrentCompletionsSlotEveryPlanExactlyOnce() throws Exception {
+        QueryPlans plans = plans(SubPlanParallelism.MAX_FANOUT_PLANS);
+        final int gatedPlans = plans.getAll().size();
+        Stub stub = new Stub(plans);
+        stub.deferAll = true;
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+        // The dispatch loop runs on this thread and parks plans 0 and 1 before any drainer starts, so the
+        // high-water mark of K_eff is reached deterministically and the assertion at the end is about the
+        // gate never going *above* it under contention.
+        assertEquals(2, stub.highWater.get());
+
+        AtomicInteger completed = new AtomicInteger();
+        CountDownLatch start = new CountDownLatch(1);
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        List<Thread> drainers = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            Thread drainer = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+                while (completed.get() < gatedPlans && System.nanoTime() < deadlineNanos) {
+                    if (stub.completeAnyParkedIfPresent()) {
+                        completed.incrementAndGet();
+                    } else {
+                        // Nothing parked yet: a permit is held by a plan another drainer is still dispatching.
+                        Thread.yield();
+                    }
+                }
+            }, "flat-fan-out-drainer-" + i);
+            drainers.add(drainer);
+            drainer.start();
+        }
+        start.countDown();
+        for (Thread drainer : drainers) {
+            drainer.join(TimeUnit.SECONDS.toMillis(30));
+            assertFalse("drainer " + drainer.getName() + " did not finish", drainer.isAlive());
+        }
+
+        // Asserted on the test thread, not inside the drainers: a bare assert in a spawned thread depends on
+        // the runner's uncaught-exception handling to be seen, and a deadlocked fan-out has to fail on this
+        // count rather than hang the suite.
+        assertEquals("every gated plan must have completed", gatedPlans, completed.get());
+        assertEquals("exactly one terminal callback", 1, listener.terminalCalls);
+        assertNull("no plan failed: " + listener.failure, listener.failure);
+        assertPlanOrder(plans, listener.results);
+        assertEquals("concurrent releases must not admit a plan past K_eff", 2, stub.highWater.get());
+    }
+
+    /**
      * SC-10 under both arms: still exactly one width line per multi-plan query, and it now names the arm
      * that produced the width. Without the {@code launch} field the two legs below are the same query with
      * the same {@code K_setting} and the same {@code n} reporting different widths for no visible reason, so
