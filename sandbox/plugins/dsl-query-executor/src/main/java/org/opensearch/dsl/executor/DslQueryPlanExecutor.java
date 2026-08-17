@@ -254,7 +254,17 @@ public class DslQueryPlanExecutor {
             // Above the bound, take the sequential path instead of trampolining every hand-off through the
             // SEARCH pool — that would add a SEARCH admission per plan completion on a path whose
             // coordinator demand is already K_eff + 1. Counted in GATED plans, not in n: the nesting comes
-            // from the plans that go through the gate, which is n - 1 staged and n flat.
+            // from the plans that go through the gate, which is n - 1 staged and n flat. At K_setting = 2
+            // that shift gives E5 two plan counts where the arms run at different widths, and they are NOT
+            // the same kind of thing.
+            // A VALID CELL at n == 2: staged gates 1, which short-circuits to K_eff = 1 (SubPlanParallelism's
+            // gatedPlans <= 1 branch), while flat gates 2 and reaches 2. That difference IS the launch shape
+            // under measurement — the reason the flat arm exists at all.
+            // NOT A COMPARABLE CELL at n == MAX_FANOUT_PLANS + 1: staged gates 8 and stays under this bound,
+            // flat gates 9 and falls back to sequential, so the width gap there measures THIS bound and not
+            // the launch shape. E5's grid is the n = 3 ladder, so no planned cell lands on it; keep it so.
+            // Same width is therefore not the comparability test either way: before comparing two arms, read
+            // the K_eff each one actually ran at off the width line, which carries launch= for exactly that.
             boolean tooManyPlans = gatedPlans > SubPlanParallelism.MAX_FANOUT_PLANS;
             // Ordered cheapest-decisive-first, deliberately. At the shipped default
             // (max_parallel_sub_plans = 1) and above the plan bound, K_eff is 1 whatever every other term
@@ -319,7 +329,9 @@ public class DslQueryPlanExecutor {
      * @param queryPlans the query's plans
      * @param from the first plan index to gate
      * @param n the query's plan count, i.e. the exclusive upper bound of the dispatch
-     * @param collector the collector every gated plan reports to, already sized for {@code n - from} reports
+     * @param collector the collector every gated plan reports to; must be sized for exactly {@code n - from}
+     *                  reports, which is checked before the first dispatch — a mismatch fails the request
+     *                  through the collector rather than hanging it, and nothing is dispatched
      * @param gate a fresh gate of the settled width, owned by this dispatch alone
      */
     private void dispatchGated(
@@ -329,6 +341,13 @@ public class DslQueryPlanExecutor {
         SubPlanResultCollector collector,
         PendingExecutions gate
     ) {
+        // The dispatch range and the collector's report count are chosen by different launch arms; a
+        // disagreement is a HANG one way and an early terminal with a duplicate query still in flight the
+        // other, never a merely wrong value. Checked before the loop, so bailing out leaks no permit and
+        // abandons no in-flight plan. STAGED (from = 1, n - 1 reporters) can never take this branch.
+        if (collector.expectGatedRange(from, n) == false) {
+            return;
+        }
         for (int i = from; i < n; i++) {
             final int idx = i;
             final QueryPlans.QueryPlan plan = queryPlans.get(idx);

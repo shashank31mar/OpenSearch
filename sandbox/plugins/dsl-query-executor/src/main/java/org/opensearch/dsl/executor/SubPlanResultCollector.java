@@ -50,6 +50,7 @@ final class SubPlanResultCollector {
     private static final Logger logger = LogManager.getLogger(SubPlanResultCollector.class);
 
     private final int n;
+    private final int reportingPlans;
     private final AtomicArray<ExecutionResult> slots;
     private final AtomicInteger pending;
     private final ConcurrentLinkedQueue<Exception> failures = new ConcurrentLinkedQueue<>();
@@ -102,6 +103,7 @@ final class SubPlanResultCollector {
             );
         }
         this.n = n;
+        this.reportingPlans = reportingPlans;
         this.slots = new AtomicArray<>(n);
         // How many plans still owe a report. Staged passes n - 1: plan 0 has already completed by the time
         // that collector exists — it is dispatched alone to warm the node's metadata cache — and its result
@@ -109,6 +111,50 @@ final class SubPlanResultCollector {
         // too, so it passes n and every plan counts itself down.
         this.pending = new AtomicInteger(reportingPlans);
         this.outer = outer;
+    }
+
+    /**
+     * Rejects a dispatch that could not drive this countdown to its terminal — checked on the caller's
+     * thread, before the first plan goes out, so nothing is in flight and no permit is held.
+     *
+     * <p>The dispatch range and this collector's report count are chosen <em>independently</em> by the two
+     * launch arms ({@code from = 1} with {@code n - 1} reporters staged, {@code 0} with {@code n} flat), and
+     * the countdown cannot notice a disagreement itself. Too MANY reporters is the failure this class exists
+     * to prevent: {@code pending} never reaches 0, {@link #finish} never runs, the request's listener is
+     * never fired and its REST channel is held open forever. Too FEW is worse than {@link #finish}'s
+     * null-slot guard suggests: a staged {@code from} of 0 dispatches plan 0 a second time <em>and</em>
+     * {@link #slotZero} still fills slot 0, so every slot is non-null and the terminal fires early with a
+     * complete-looking result while a duplicate distributed query is still running — a fast-but-wrong
+     * number on the E5 path.
+     *
+     * <p>Reported through {@code outer} rather than thrown. The flat arm — the only one that can reach a
+     * mismatch — calls this on the request thread inside a plain runnable that the transport action does not
+     * wrap, so a bare throw would leave the channel open: the very hang being guarded. Unconditional rather
+     * than an {@code assert}, because assertions are on in the test JVMs and off in a distribution, i.e. off
+     * precisely on the benchmark node.
+     *
+     * @param from the first plan index the caller is about to dispatch
+     * @param n the caller's plan count, i.e. the exclusive upper bound of its dispatch
+     * @return {@code false} when the pairing cannot terminate, having already failed the request's listener
+     */
+    boolean expectGatedRange(int from, int n) {
+        if (n == this.n && reportingPlans == n - from) {
+            return true;
+        }
+        IllegalStateException e = new IllegalStateException(
+            "a fan-out collector of "
+                + this.n
+                + " plans expecting "
+                + reportingPlans
+                + " reports cannot be driven by a dispatch of plans ["
+                + from
+                + ", "
+                + n
+                + ")"
+        );
+        logger.error("dsl.fanout dispatch/report-count mismatch; the query is failed rather than hung", e);
+        outer.onFailure(e);
+        return false;
     }
 
     /**

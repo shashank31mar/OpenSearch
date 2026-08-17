@@ -99,6 +99,35 @@ public class SubPlanResultCollectorTests extends OpenSearchTestCase {
         assertNotNull(new SubPlanResultCollector(3, 3, new CapturingListener()));
     }
 
+    /**
+     * The dispatch range and the report count are two numbers picked by two different launch arms, and this
+     * check is the only thing stopping them from disagreeing. Both single-keystroke edits are covered: a flat
+     * collector ({@code n} reporters) driven by a staged dispatch leaves the countdown one report short
+     * forever, and a staged collector ({@code n - 1}) driven by a flat dispatch fires its terminal early.
+     */
+    public void testRejectsADispatchRangeThatDisagreesWithTheReportCount() {
+        CapturingListener flatListener = new CapturingListener();
+        assertFalse(new SubPlanResultCollector(3, 3, flatListener).expectGatedRange(1, 3));
+        assertEquals("the request must be failed, exactly once", 1, flatListener.terminalCalls);
+        assertEquals(
+            "a fan-out collector of 3 plans expecting 3 reports cannot be driven by a dispatch of plans [1, 3)",
+            flatListener.failure.getMessage()
+        );
+
+        // The mirror image: a staged collector driven by a flat dispatch would fire one report early.
+        CapturingListener stagedListener = new CapturingListener();
+        assertFalse(new SubPlanResultCollector(3, stagedListener).expectGatedRange(0, 3));
+        assertEquals(1, stagedListener.terminalCalls);
+        // A plan count that is not this collector's own is the same class of bug, one argument further out.
+        assertFalse(new SubPlanResultCollector(3, new CapturingListener()).expectGatedRange(1, 4));
+
+        // Both real pairings must pass, or the check would break the arms it protects.
+        CapturingListener ok = new CapturingListener();
+        assertTrue(new SubPlanResultCollector(3, ok).expectGatedRange(1, 3));
+        assertTrue(new SubPlanResultCollector(3, 3, ok).expectGatedRange(0, 3));
+        assertEquals("a matching pairing must not touch the listener", 0, ok.terminalCalls);
+    }
+
     public void testFiresOnceWhenAllSlotsFilled() {
         CapturingListener listener = new CapturingListener();
         SubPlanResultCollector collector = new SubPlanResultCollector(3, listener);

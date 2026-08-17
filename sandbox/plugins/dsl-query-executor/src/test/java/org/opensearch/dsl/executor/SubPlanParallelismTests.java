@@ -150,18 +150,27 @@ public class SubPlanParallelismTests extends OpenSearchTestCase {
     }
 
     /**
-     * The explicit-count overload must agree with {@link SubPlanParallelism#decide(Inputs)} on the staged
-     * count for every cell of the grid — otherwise the refactor that introduced it changed the shipped
-     * width somewhere, which is the one thing the launch-mode switch may not do.
+     * The explicit-count overload — the <b>only</b> entry point production uses
+     * ({@code DslQueryPlanExecutor.decideWidth}) — pinned against the frozen table at both launch counts.
+     *
+     * <p>Asserting it against {@link SubPlanParallelism#decide(Inputs)} instead proves nothing: that
+     * overload <i>is</i> {@code decide(in, in.n() - 1)}, so both sides are one call. On this grid
+     * ({@code n = 3}, {@code K_setting = 2}) the decision is in fact invariant for every
+     * {@code gatedPlans >= 2}, because {@code min(MAX_K_SETTING, K_setting) = 2} binds before the
+     * {@code gatedPlans} term — the two sides agree whatever the delegation passes, the flat count included.
+     *
+     * <p>The flat leg records that invariance: at {@code n = 3} both E5 arms run at the <b>same</b> width and
+     * differ only in dispatch shape, which is what makes those cells comparable. It is <b>not</b> a claim
+     * that this assertion would catch a widening on its own — {@code gridInputs} passes {@code K_setting = 2}
+     * as a literal and the setting itself maxes at 2, so raising {@code MAX_K_SETTING} alone moves nothing
+     * here. What it does catch is either launch count being rewired at its call site.
      */
-    public void testGatedCountOverloadAgreesWithTheStagedFormOnTheWholeGrid() {
+    public void testBothLaunchCountsMatchTheFrozenGrid() {
         for (GridCell cell : GRID) {
             SubPlanParallelism.Inputs in = gridInputs(cell);
-            assertEquals(
-                "staged and decide(in, n - 1) must agree at " + cell.vCpu() + " vCPU / S=" + cell.shardsOnBusiestNode(),
-                SubPlanParallelism.decide(in),
-                SubPlanParallelism.decide(in, in.n() - 1)
-            );
+            String where = cell.vCpu() + " vCPU / S=" + cell.shardsOnBusiestNode();
+            assertEquals("staged count at " + where, cell.expectedKEff(), SubPlanParallelism.decide(in, in.n() - 1).kEff());
+            assertEquals("flat count at " + where, cell.expectedKEff(), SubPlanParallelism.decide(in, in.n()).kEff());
         }
     }
 
