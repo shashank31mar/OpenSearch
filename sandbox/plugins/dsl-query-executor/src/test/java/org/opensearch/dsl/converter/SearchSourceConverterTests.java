@@ -9,9 +9,16 @@
 package org.opensearch.dsl.converter;
 
 import org.apache.calcite.jdbc.CalciteSchema;
+import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableScan;
+import org.apache.calcite.rel.metadata.JaninoRelMetadataProvider;
+import org.apache.calcite.rel.metadata.RelMdUtil;
+import org.apache.calcite.rel.metadata.RelMetadataQueryBase;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.schema.SchemaPlus;
@@ -27,6 +34,7 @@ import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.dsl.golden.CalciteTestInfra;
 import org.opensearch.dsl.golden.GoldenFileLoader;
 import org.opensearch.dsl.golden.GoldenTestCase;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
@@ -38,13 +46,33 @@ import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.hamcrest.Matchers.containsString;
+
 public class SearchSourceConverterTests extends OpenSearchTestCase {
+
+    /** Invalidate/get rounds each plan's thread runs against its own cluster. */
+    private static final int METADATA_ROUNDS = 200;
+
+    /** Bound on the start barrier so a stuck worker fails the test instead of hanging it. */
+    private static final int BARRIER_TIMEOUT_SECONDS = 30;
+
+    /** Bound on joining each worker. */
+    private static final int JOIN_TIMEOUT_SECONDS = 60;
 
     private SearchSourceConverter converter;
 
@@ -125,6 +153,25 @@ public class SearchSourceConverterTests extends OpenSearchTestCase {
         assertFalse(plans.has(QueryPlans.Type.AGGREGATION));
     }
 
+    public void testSizeZeroNoAggsWithInvalidQueryThrowsInsteadOfZeroPlans() {
+        // The zero-plan path still has to translate the query clause, because translating it is what
+        // validates it: an unknown field must surface as a ConversionException (which the transport
+        // turns into a failure response) instead of an empty, indistinguishable "no results" answer.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).query(QueryBuilders.termQuery("nope", "x"));
+
+        ConversionException e = expectThrows(ConversionException.class, () -> converter.convert(source, "test-index"));
+        assertThat(e.getMessage(), containsString("nope"));
+    }
+
+    public void testSizeZeroNoAggsWithValidQueryStillProducesNoPlans() throws ConversionException {
+        // The guard above must not turn a valid query into an error: a resolvable query clause on the
+        // zero-plan path is still a normal empty result, not a failure.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).query(QueryBuilders.termQuery("brand", "acme"));
+        QueryPlans plans = converter.convert(source, "test-index");
+
+        assertEquals(0, plans.getAll().size());
+    }
+
     public void testAggPlanIncludesPostAggSort() throws ConversionException {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0)
             .aggregation(
@@ -189,6 +236,204 @@ public class SearchSourceConverterTests extends OpenSearchTestCase {
         List<QueryPlans.QueryPlan> aggPlans = plans.get(QueryPlans.Type.AGGREGATION);
         assertEquals(2, aggPlans.size());
         assertNotEquals(aggPlans.get(0).granularity(), aggPlans.get(1).granularity());
+    }
+
+    // ---- Per-plan planning isolation (SC-5) ----
+
+    public void testEachPlanHasItsOwnCluster() throws ConversionException {
+        List<QueryPlans.QueryPlan> all = converter.convert(nestedThreeLevelSource(), "test-index").getAll();
+        assertEquals("expected 1 HITS + 2 AGGREGATION plans", 3, all.size());
+
+        for (int i = 0; i < all.size(); i++) {
+            for (int j = i + 1; j < all.size(); j++) {
+                assertNotSame(
+                    "plans " + i + " and " + j + " share one RelOptCluster",
+                    all.get(i).relNode().getCluster(),
+                    all.get(j).relNode().getCluster()
+                );
+            }
+        }
+
+        Set<RelOptCluster> clusters = Collections.newSetFromMap(new IdentityHashMap<>());
+        all.forEach(plan -> clusters.add(plan.relNode().getCluster()));
+        assertEquals("one cluster per plan", all.size(), clusters.size());
+    }
+
+    public void testNewBaseReturnsFreshClusterCtxAndSubtreePerCall() throws ConversionException {
+        CalciteTestInfra.InfraResult infra = CalciteTestInfra.buildFromMapping("test-index", testIndexMapping());
+        SearchSourceBuilder source = nestedThreeLevelSource();
+
+        SearchSourceConverter.PlanBase first = converter.newBase(infra.table(), source);
+        SearchSourceConverter.PlanBase second = converter.newBase(infra.table(), source);
+
+        // The query clause must have been applied per call — otherwise the "fresh subtree" assertion
+        // below would only be about the scan and would not cover the shared Scan → Filter base.
+        assertTrue("newBase must apply the query clause", first.base() instanceof LogicalFilter);
+
+        assertNotSame(first.ctx(), second.ctx());
+        assertNotSame(first.ctx().getCluster(), second.ctx().getCluster());
+        assertNotSame(first.base(), second.base());
+
+        // Deliberately shared: one RexBuilder across the per-plan clusters, whose fields are all
+        // final. The other shared piece — one RelOptTable identity per request — cannot be asserted
+        // here: this test hands both calls the same table, so any such assertion would hold even if
+        // convert() resolved a fresh table per plan. testAllPlansShareOneRelOptTable proves it from
+        // the plans convert() actually emits.
+        assertSame(first.ctx().getRexBuilder(), second.ctx().getRexBuilder());
+    }
+
+    public void testNoIdentitySharedRelNodesBetweenPlans() throws ConversionException {
+        List<QueryPlans.QueryPlan> all = converter.convert(nestedThreeLevelSource(), "test-index").getAll();
+        assertEquals(3, all.size());
+
+        List<Set<RelNode>> nodesPerPlan = all.stream().map(plan -> collectNodes(plan.relNode())).collect(Collectors.toList());
+        for (Set<RelNode> nodes : nodesPerPlan) {
+            // A shared base would show up as a shared LogicalFilter, so the walk has to reach one.
+            assertTrue("plan has no LogicalFilter to share", nodes.stream().anyMatch(n -> n instanceof LogicalFilter));
+        }
+
+        for (int i = 0; i < nodesPerPlan.size(); i++) {
+            for (int j = i + 1; j < nodesPerPlan.size(); j++) {
+                Set<RelNode> shared = Collections.newSetFromMap(new IdentityHashMap<>());
+                shared.addAll(nodesPerPlan.get(i));
+                shared.retainAll(nodesPerPlan.get(j));
+                assertTrue("plans " + i + " and " + j + " share RelNodes: " + shared, shared.isEmpty());
+            }
+        }
+    }
+
+    public void testAllPlansShareOneRelOptTable() throws ConversionException {
+        // SC-5's shared half: catalogReader.getTable runs once per request, so every plan of the
+        // request scans the same RelOptTable instance. The tables are read back out of the emitted
+        // RelNodes — nothing here is handed to the converter, so resolving a table per plan (each
+        // getTable call builds a new RelOptTableImpl) makes this fail.
+        List<QueryPlans.QueryPlan> all = converter.convert(nestedThreeLevelSource(), "test-index").getAll();
+        assertEquals("expected 1 HITS + 2 AGGREGATION plans", 3, all.size());
+
+        Set<RelOptTable> tables = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (QueryPlans.QueryPlan plan : all) {
+            Set<RelOptTable> planTables = scanTablesOf(plan.relNode());
+            // Every plan must reach a scan, or "same table everywhere" would hold over nothing.
+            assertFalse("plan " + plan.granularity() + " has no TableScan", planTables.isEmpty());
+            tables.addAll(planTables);
+        }
+
+        assertEquals("one RelOptTable identity across all plans, but got " + tables, 1, tables.size());
+        RelOptTable shared = tables.iterator().next();
+        for (QueryPlans.QueryPlan plan : all) {
+            for (RelOptTable table : scanTablesOf(plan.relNode())) {
+                assertSame("every plan must scan the one RelOptTable resolved once per request", shared, table);
+            }
+        }
+    }
+
+    /**
+     * Replays, on all plans of one request at once, the per-plan pair of calls the engine makes at
+     * {@code DefaultPlanExecutor}: set {@code THREAD_PROVIDERS}, then invalidate that plan's metadata
+     * query. Pre-isolation the plans share one {@code RelOptCluster} whose {@code mq} field is neither
+     * volatile nor guarded, so one thread's {@code invalidateMetadataQuery()} can land inside another's
+     * unsynchronized lazy init and make {@code getMetadataQuery()} return null.
+     *
+     * <p>The failure mode is seed-dependent (NPE / corrupted metadata table / spurious
+     * {@code CyclicMetadataException}), so the assertion is only "no throwable escaped".
+     */
+    public void testConcurrentMetadataAccessAcrossPlansIsIsolated() throws Exception {
+        List<QueryPlans.QueryPlan> all = converter.convert(nestedThreeLevelSource(), "test-index").getAll();
+        assertEquals(3, all.size());
+
+        Queue<Throwable> errors = new ConcurrentLinkedQueue<>();
+        CyclicBarrier barrier = new CyclicBarrier(all.size());
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < all.size(); i++) {
+            RelNode relNode = all.get(i).relNode();
+            threads.add(new Thread(() -> {
+                try {
+                    // G5: a pooled thread that already carries a provider would mask a missing set()
+                    // and make this probe vacuous.
+                    RelMetadataQueryBase.THREAD_PROVIDERS.remove();
+                    RelOptCluster cluster = relNode.getCluster();
+                    barrier.await(BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    for (int round = 0; round < METADATA_ROUNDS; round++) {
+                        RelMetadataQueryBase.THREAD_PROVIDERS.set(JaninoRelMetadataProvider.of(cluster.getMetadataProvider()));
+                        cluster.invalidateMetadataQuery();
+                        RelMdUtil.clearCache(relNode);
+                        assertNotNull(cluster.getMetadataQuery().getRowCount(relNode));
+                    }
+                } catch (Throwable t) {
+                    errors.offer(t);
+                } finally {
+                    RelMetadataQueryBase.THREAD_PROVIDERS.remove();
+                }
+            }, "dsl-plan-metadata-" + i));
+        }
+
+        threads.forEach(Thread::start);
+        for (Thread thread : threads) {
+            thread.join(TimeUnit.SECONDS.toMillis(JOIN_TIMEOUT_SECONDS));
+            assertFalse("worker did not finish: " + thread.getName(), thread.isAlive());
+        }
+        assertTrue(errors.toString(), errors.isEmpty());
+    }
+
+    public void testConversionFailureOnUnknownFieldPropagates() {
+        // Filter conversion now runs once per emitted plan; a per-plan failure must still surface as
+        // one exception out of convert() rather than being swallowed by the emit loop.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(10)
+            .query(QueryBuilders.termQuery("nope", "x"))
+            .aggregation(
+                new TermsAggregationBuilder("by_brand").field("brand").subAggregation(new AvgAggregationBuilder("avg").field("price"))
+            );
+
+        ConversionException e = expectThrows(ConversionException.class, () -> converter.convert(source, "test-index"));
+        assertThat(e.getMessage(), containsString("nope"));
+    }
+
+    /** The 3-level nested source that emits 1 HITS + 2 AGGREGATION plans. */
+    private static SearchSourceBuilder nestedThreeLevelSource() {
+        return new SearchSourceBuilder().size(10)
+            .query(QueryBuilders.termQuery("brand", "acme"))
+            .aggregation(
+                new TermsAggregationBuilder("by_brand").field("brand")
+                    .subAggregation(
+                        new TermsAggregationBuilder("by_name").field("name")
+                            .subAggregation(new AvgAggregationBuilder("avg_price").field("price"))
+                    )
+            );
+    }
+
+    /** The same four fields {@link #setUp} registers, for building a standalone {@link RelOptTable}. */
+    private static Map<String, String> testIndexMapping() {
+        Map<String, String> mapping = new LinkedHashMap<>();
+        mapping.put("name", "VARCHAR");
+        mapping.put("price", "INTEGER");
+        mapping.put("brand", "VARCHAR");
+        mapping.put("rating", "DOUBLE");
+        return mapping;
+    }
+
+    /** Collects a plan's RelNodes into an identity set. */
+    private static Set<RelNode> collectNodes(RelNode root) {
+        Set<RelNode> nodes = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<RelNode> pending = new ArrayDeque<>();
+        pending.push(root);
+        while (!pending.isEmpty()) {
+            RelNode current = pending.pop();
+            if (nodes.add(current)) {
+                current.getInputs().forEach(pending::push);
+            }
+        }
+        return nodes;
+    }
+
+    /** Returns the identity set of tables scanned anywhere in a plan (all branches, not just input 0). */
+    private static Set<RelOptTable> scanTablesOf(RelNode root) {
+        Set<RelOptTable> tables = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (RelNode node : collectNodes(root)) {
+            if (node instanceof TableScan) {
+                tables.add(node.getTable());
+            }
+        }
+        return tables;
     }
 
     // ---- Golden file driven RelNode generation tests ----

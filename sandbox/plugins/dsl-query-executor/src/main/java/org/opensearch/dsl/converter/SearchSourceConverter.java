@@ -43,7 +43,8 @@ import java.util.Properties;
  */
 public class SearchSourceConverter {
 
-    private final RelOptCluster cluster;
+    private final RelDataTypeFactory typeFactory;
+    private final RexBuilder rexBuilder;
     private final CalciteCatalogReader catalogReader;
     private final FilterConverter filterConverter;
     private final ProjectConverter projectConverter;
@@ -60,9 +61,13 @@ public class SearchSourceConverter {
     public SearchSourceConverter(SchemaPlus schema) {
         // TODO: Once Analytics plugin starts providing the RelOptTable, use it directly —
         // no need to reconstruct typeFactory, CatalogReader, and planning infrastructure here.
-        RelDataTypeFactory typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
-        HepPlanner planner = new HepPlanner(HepProgram.builder().build());
-        this.cluster = RelOptCluster.create(planner, new RexBuilder(typeFactory));
+        // The RelOptCluster is deliberately NOT a field: it carries unguarded mutable metadata state
+        // (mq / mqSupplier / metadataProvider) that every plan of a request would otherwise share, so
+        // it is built per emitted plan in newBase(). Sharing the RexBuilder shares the type factory
+        // into each per-plan cluster (RelOptCluster.create derives it from rexBuilder), which keeps
+        // RelDataType instances interned across plans; every RexBuilder field is final.
+        this.typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
+        this.rexBuilder = new RexBuilder(typeFactory);
 
         CalciteSchema rootSchema = CalciteSchema.from(schema);
         this.catalogReader = new CalciteCatalogReader(
@@ -96,23 +101,20 @@ public class SearchSourceConverter {
             throw new IllegalArgumentException("Index not found in schema: " + indexName);
         }
 
-        ConversionContext ctx = new ConversionContext(searchSource, cluster, table);
-
-        // Shared base: Scan → Filter
-        RelNode base = LogicalTableScan.create(cluster, table, List.of());
-        base = filterConverter.convert(base, ctx);
-
         int size = searchSource.size() != -1 ? searchSource.size() : SearchService.DEFAULT_SIZE;
         boolean hasAggs = hasAggregations(searchSource);
 
         QueryPlans.Builder builder = new QueryPlans.Builder();
+        int emitted = 0;
 
         // Hits path: Scan → Filter → Project → Sort
         // size=0 skips hits — total doc count comes from analytics plugin metadata
         if (size > 0) {
-            RelNode hits = projectConverter.convert(base, ctx);
-            hits = sortConverter.convert(hits, ctx);
+            PlanBase hitsBase = newBase(table, searchSource);
+            RelNode hits = projectConverter.convert(hitsBase.base(), hitsBase.ctx());
+            hits = sortConverter.convert(hits, hitsBase.ctx());
             builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.HITS, hits, GranularityKeys.ROOT));
+            emitted++;
         }
 
         // Aggregation path: Scan → Filter → Aggregate → PostAggregate (one per granularity level)
@@ -120,18 +122,68 @@ public class SearchSourceConverter {
             List<AggregationTreeWalker.Granularity> granularities = treeWalker.walk(
                 searchSource.aggregations().getAggregatorFactories(),
                 table.getRowType(),
-                cluster.getTypeFactory()
+                typeFactory
             );
             for (AggregationTreeWalker.Granularity granularity : granularities) {
                 AggregationMetadata metadata = granularity.metadata();
-                ConversionContext aggCtx = ctx.withAggregationMetadata(metadata);
-                RelNode aggs = aggConverter.convert(base, metadata);
+                // One base per granularity, not per metric: the walker already merged same-granularity
+                // metrics into one entry, so plan count stays equal to granularity count.
+                PlanBase aggBase = newBase(table, searchSource);
+                ConversionContext aggCtx = aggBase.ctx().withAggregationMetadata(metadata);
+                RelNode aggs = aggConverter.convert(aggBase.base(), metadata);
                 aggs = postAggConverter.convert(aggs, aggCtx);
                 builder.add(new QueryPlans.QueryPlan(QueryPlans.Type.AGGREGATION, aggs, granularity.key()));
+                emitted++;
             }
         }
 
+        // Translating the query clause is what validates it, and it only happens inside newBase(), so
+        // a request that emits no plan (size=0 with no aggs) would never look at its query at all —
+        // a malformed query would come back as an empty 200 instead of the conversion error the
+        // pre-fan-out request path raised. Translate it once here and drop the result: the base is
+        // fresh and unshared, so per-plan isolation is untouched.
+        if (emitted == 0) {
+            newBase(table, searchSource);
+        }
+
         return builder.build();
+    }
+
+    /**
+     * Builds the planning state for one emitted plan: its own {@link RelOptCluster}, its own
+     * {@link ConversionContext} and its own {@code Scan → Filter} subtree.
+     *
+     * <p>Called once per emitted plan so that concurrent planning of a request's plans shares no
+     * mutable Calcite state — and once, with the result discarded, for a request that emits no plan
+     * at all, so its {@code query} clause is still translated and therefore still validated. What stays shared is provably immutable or thread-safe: the
+     * {@link RexBuilder} (all fields final), its type factory (mutable state is static and
+     * thread-safe) and the {@code table} — one {@link RelOptTable} identity across all plans, since
+     * {@code catalogReader.getTable} is called once per request, outside this method, before any
+     * fan-out. A fresh cluster also gives each plan its own {@code nextCorrel} /
+     * {@code mapCorrelToRel} and its own {@code RelTraitSet} cache.
+     *
+     * <p>Package-private on purpose: no other component consumes it, and the per-plan isolation
+     * assertions live in {@code SearchSourceConverterTests}.
+     *
+     * @param table the resolved Calcite table, shared by every plan of the request
+     * @param searchSource the DSL query
+     * @return this plan's context paired with its {@code Scan → Filter} subtree
+     * @throws ConversionException if the {@code query} clause fails to convert
+     */
+    PlanBase newBase(RelOptTable table, SearchSourceBuilder searchSource) throws ConversionException {
+        RelOptCluster cluster = RelOptCluster.create(new HepPlanner(HepProgram.builder().build()), rexBuilder);
+        ConversionContext ctx = new ConversionContext(searchSource, cluster, table);
+        RelNode scan = LogicalTableScan.create(cluster, table, List.of());
+        return new PlanBase(ctx, filterConverter.convert(scan, ctx));
+    }
+
+    /**
+     * One emitted plan's planning base.
+     *
+     * @param ctx the context every converter for this plan must be handed
+     * @param base this plan's own {@code Scan → Filter} subtree
+     */
+    record PlanBase(ConversionContext ctx, RelNode base) {
     }
 
     private static boolean hasAggregations(SearchSourceBuilder searchSource) {
