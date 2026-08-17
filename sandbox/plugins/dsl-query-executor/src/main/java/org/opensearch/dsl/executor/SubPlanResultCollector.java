@@ -56,11 +56,30 @@ final class SubPlanResultCollector {
     private final ActionListener<List<ExecutionResult>> outer;
 
     /**
+     * A collector for the <b>staged</b> launch: plan 0 has already completed, so only the {@code n - 1}
+     * fanned-out plans report through {@link #planSucceeded} / {@link #planFailed} and plan 0's result
+     * arrives through {@link #slotZero}.
+     *
      * @param n total number of plans in the query, including plan 0; must be at least 2
      * @param outer the request's listener, fired exactly once
      * @throws IllegalArgumentException if {@code n < 2}, which would make the countdown unable to complete
      */
     SubPlanResultCollector(int n, ActionListener<List<ExecutionResult>> outer) {
+        this(n, n - 1, outer);
+    }
+
+    /**
+     * @param n total number of plans in the query, including plan 0; must be at least 2
+     * @param reportingPlans how many of those plans will report through {@link #planSucceeded} /
+     *                       {@link #planFailed}, i.e. how many go through the permit gate: {@code n - 1}
+     *                       for the staged launch (plan 0 ran before this collector existed and is slotted
+     *                       by {@link #slotZero}), {@code n} for the flat launch of experiment E5, where
+     *                       plan 0 is gated like any other and {@code slotZero} is not used at all
+     * @param outer the request's listener, fired exactly once
+     * @throws IllegalArgumentException if {@code n < 2}, or if {@code reportingPlans} is not in
+     *                                  {@code [1, n]} — both would make the countdown unable to complete
+     */
+    SubPlanResultCollector(int n, int reportingPlans, ActionListener<List<ExecutionResult>> outer) {
         if (n < 2) {
             // Rejected rather than tolerated, because the tolerated form is a HANG. With n <= 1 the
             // countdown below starts at or below 0, nothing ever calls countDown() (slotZero deliberately
@@ -73,16 +92,30 @@ final class SubPlanResultCollector {
             // construction bug surfaces as an honest error response rather than as a hung request.
             throw new IllegalArgumentException("a fan-out collector needs at least 2 plans, got " + n);
         }
+        if (reportingPlans < 1 || reportingPlans > n) {
+            // The same hang, one argument further out: a countdown that starts at 0 (or below) never
+            // reaches its terminal, and one that starts above n can never be driven to zero because there
+            // are only n plans to report. Rejected here for the same reason as n < 2 — loudly, on the
+            // caller's thread, rather than as a REST channel held open forever.
+            throw new IllegalArgumentException(
+                "a fan-out collector of " + n + " plans needs 1.." + n + " reporters, got " + reportingPlans
+            );
+        }
         this.n = n;
         this.slots = new AtomicArray<>(n);
-        // Plan 0 has already completed by the time this collector exists — it is dispatched alone to warm
-        // the node's metadata cache — so only the n - 1 fanned-out plans are counted down.
-        this.pending = new AtomicInteger(n - 1);
+        // How many plans still owe a report. Staged passes n - 1: plan 0 has already completed by the time
+        // that collector exists — it is dispatched alone to warm the node's metadata cache — and its result
+        // arrives through slotZero, which deliberately does not count down. The flat launch gates plan 0
+        // too, so it passes n and every plan counts itself down.
+        this.pending = new AtomicInteger(reportingPlans);
         this.outer = outer;
     }
 
     /**
-     * Records plan 0's result without counting down: it completed before the fan-out started.
+     * Records plan 0's result without counting down: it completed before the fan-out started. Staged
+     * launches only — under a flat launch plan 0 goes through the gate and reports through
+     * {@link #planSucceeded} like every other plan, and calling this as well would leave the countdown one
+     * report short of its terminal.
      *
      * @param result plan 0's result
      */

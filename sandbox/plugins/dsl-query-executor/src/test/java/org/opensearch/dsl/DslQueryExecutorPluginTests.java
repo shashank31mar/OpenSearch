@@ -59,12 +59,17 @@ public class DslQueryExecutorPluginTests extends OpenSearchTestCase {
 
     /**
      * A setting missing from {@code getSettings()} is invisible to {@code _cluster/settings} (a PUT of
-     * it is a 400) and not resolvable by key from another plugin's classloader.
+     * it is a 400) and not resolvable by key from another plugin's classloader. Spelled out as literal keys
+     * rather than derived from {@code DslQuerySettings.all()}: the keys are the operator-facing contract, so
+     * a rename has to be visible here.
      */
-    public void testGetSettingsRegistersInterceptGateAndFanOutWidth() {
+    public void testGetSettingsRegistersInterceptGateAndFanOutSettings() {
         Set<String> keys = plugin.getSettings().stream().map(Setting::getKey).collect(Collectors.toSet());
 
-        assertEquals(Set.of("dsl.query_executor.intercept_search.enabled", "dsl.query.max_parallel_sub_plans"), keys);
+        assertEquals(
+            Set.of("dsl.query_executor.intercept_search.enabled", "dsl.query.max_parallel_sub_plans", "dsl.query.fanout_launch"),
+            keys
+        );
     }
 
     /**

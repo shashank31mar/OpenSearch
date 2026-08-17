@@ -121,6 +121,50 @@ public class SubPlanParallelismTests extends OpenSearchTestCase {
         assertEquals(1, SubPlanParallelism.computeKEff(inputs(0, 2, 64, true, 1, OptionalInt.of(97))));
     }
 
+    /**
+     * The flat launch's clamp, and the single arithmetic reason experiment E5 needed a code change: the
+     * width is bounded by the number of plans that go through the gate, which is {@code n} rather than
+     * {@code n - 1} when no plan is held back to warm the metadata cache.
+     *
+     * <p>{@code n = 2} is the discriminating cell — the 2-level nested aggregation with {@code size: 0} that
+     * produces exactly two plans. Staged pins it at 1 (asserted here as the control, so the difference is
+     * attributable to the gated-plan count and to nothing else); flat must reach 2.
+     */
+    public void testFlatLaunchClampsToTheWholePlanCountNotOneLess() {
+        SubPlanParallelism.Inputs twoPlans = inputs(2, 2, 64, true, 1, OptionalInt.of(97));
+        assertEquals(
+            "the staged control: one plan left to gate, so the width cannot exceed 1",
+            1,
+            SubPlanParallelism.decide(twoPlans).kEff()
+        );
+        assertEquals(
+            "both plans are gated, so a 2-plan query can finally run at width 2",
+            2,
+            SubPlanParallelism.decide(twoPlans, 2).kEff()
+        );
+
+        // The operator cap still binds above it: 3 gated plans do not buy a width of 3.
+        assertEquals(SubPlanParallelism.MAX_K_SETTING, SubPlanParallelism.decide(inputs(3, 2, 64, true, 1, OptionalInt.of(97)), 3).kEff());
+        // And so does every other term — a narrow SEARCH pool pins the flat arm exactly as it pins staged.
+        assertEquals(1, SubPlanParallelism.decide(inputs(2, 2, 32, true, 8, OptionalInt.of(3)), 2).kEff());
+    }
+
+    /**
+     * The explicit-count overload must agree with {@link SubPlanParallelism#decide(Inputs)} on the staged
+     * count for every cell of the grid — otherwise the refactor that introduced it changed the shipped
+     * width somewhere, which is the one thing the launch-mode switch may not do.
+     */
+    public void testGatedCountOverloadAgreesWithTheStagedFormOnTheWholeGrid() {
+        for (GridCell cell : GRID) {
+            SubPlanParallelism.Inputs in = gridInputs(cell);
+            assertEquals(
+                "staged and decide(in, n - 1) must agree at " + cell.vCpu() + " vCPU / S=" + cell.shardsOnBusiestNode(),
+                SubPlanParallelism.decide(in),
+                SubPlanParallelism.decide(in, in.n() - 1)
+            );
+        }
+    }
+
     /** The operator cap is re-applied here, not merely trusted from the setting. */
     public void testKSettingIsReclampedToTheHardMaximum() {
         // n = 9 so neither n - 1 nor any other term can be what limits the result to 2.

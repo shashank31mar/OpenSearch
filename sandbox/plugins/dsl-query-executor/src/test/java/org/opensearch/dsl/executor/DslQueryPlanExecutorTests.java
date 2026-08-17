@@ -642,6 +642,217 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         assertPlanOrder(plans, listener.results);
     }
 
+    // ── The FLAT launch (design experiment E5) ──────────────────────────────
+
+    /**
+     * <b>The reason the flat arm exists.</b> A 2-plan query — a 2-level nested aggregation with
+     * {@code size: 0}, the measured production shape — can never overlap anything under the staged launch,
+     * because plan 0 runs alone and the width is clamped to {@code n - 1 == 1}. Flat gates both plans, so
+     * {@code K_eff} is 2 and they are genuinely in flight together.
+     *
+     * <p>The discriminating observation is the state <em>before any completion</em>: both plans dispatched
+     * and both outstanding. No staged run of any width can produce that, which is exactly why the staged
+     * control is asserted in the same test rather than left implicit.
+     */
+    public void testFlatWithTwoPlansRunsBothConcurrently() {
+        QueryPlans plans = plans(2);
+        Stub stub = new Stub(plans);
+        stub.deferAll = true;
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+
+        assertEquals("both plans must be dispatched before either completes", List.of(0, 1), stub.dispatchOrder());
+        assertEquals("K_eff = 2 at n = 2 is the whole point of the flat arm", 2, stub.inFlight.get());
+        assertEquals(2, stub.highWater.get());
+
+        stub.completeParked(1);
+        assertNull("the listener must wait for plan 0", listener.results);
+        stub.completeParked(0);
+
+        assertEquals("exactly one terminal callback", 1, listener.terminalCalls);
+        assertPlanOrder(plans, listener.results);
+
+        // The control, same width setting: staged cannot overlap a 2-plan query at all.
+        QueryPlans staged = plans(2);
+        Stub stagedStub = new Stub(staged);
+        stagedStub.deferAll = true;
+        executor(stagedStub, 2).execute(staged, null, "test-index", new CapturingListener());
+        assertEquals("staged dispatches plan 0 alone", List.of(0), stagedStub.dispatchOrder());
+        assertEquals(1, stagedStub.highWater.get());
+    }
+
+    /**
+     * Slotting by plan index under a flat launch, proved by completing the plans in an order unrelated to
+     * their plan order — including plan 0 <b>last</b>, which the staged shape cannot express because plan 0
+     * has already completed before its collector exists.
+     */
+    public void testFlatResultsInPlanOrderWhenCompletionOrderShuffled() {
+        QueryPlans plans = plans(4);
+        Stub stub = new Stub(plans);
+        stub.deferAll = true;
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+
+        // K_eff = 2, so plans 0 and 1 are in flight and plans 2 and 3 are queued behind them.
+        assertEquals(List.of(0, 1), stub.dispatchOrder());
+        stub.completeParked(1);
+        assertEquals("finishing plan 1 must admit the queued plan 2", List.of(0, 1, 2), stub.dispatchOrder());
+        stub.completeParked(2);
+        assertEquals("finishing plan 2 must admit the queued plan 3", List.of(0, 1, 2, 3), stub.dispatchOrder());
+        stub.completeParked(3);
+        assertNull("the listener must wait for plan 0", listener.results);
+        stub.completeParked(0);
+
+        assertEquals(1, listener.terminalCalls);
+        assertPlanOrder(plans, listener.results);
+    }
+
+    /** The gate's whole job, on the flat path. Run with {@code -Dtests.iters=100}. */
+    public void testFlatNeverMoreThanKEffInFlight() {
+        QueryPlans plans = plans(6);
+        Stub stub = new Stub(plans);
+        stub.deferAll = true;
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+
+        assertEquals(2, stub.inFlight.get());
+        while (listener.terminalCalls == 0) {
+            stub.completeAnyParked();
+            assertTrue("in-flight " + stub.inFlight.get() + " exceeded K_eff", stub.inFlight.get() <= 2);
+        }
+        assertEquals("high-water must not exceed K_eff", 2, stub.highWater.get());
+        assertPlanOrder(plans, listener.results);
+    }
+
+    /**
+     * A mid-flight failure under a flat launch: the listener still fires exactly once, still carries the
+     * first failure, and still fires only after every sibling has reported — firing early would abandon
+     * distributed queries with nobody left to report to.
+     */
+    public void testFlatCompletesListenerExactlyOnceOnMidFlightFailure() {
+        RuntimeException boom = new RuntimeException("plan 1 failed");
+        QueryPlans plans = plans(3);
+        Stub stub = new Stub(plans);
+        stub.defer.add(0);
+        stub.failInline.put(1, boom);
+        stub.defer.add(2);
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+
+        assertEquals("plan 1's failure released its permit, so plan 2 must have been admitted", List.of(0, 1, 2), stub.dispatchOrder());
+        assertEquals("plans 0 and 2 are still running", 0, listener.terminalCalls);
+
+        stub.completeParked(2);
+        assertEquals("plan 0 is still running", 0, listener.terminalCalls);
+        stub.completeParked(0);
+
+        assertEquals("exactly one terminal callback", 1, listener.terminalCalls);
+        assertSame("the first failure must reach the listener unchanged", boom, listener.failure);
+        assertNull("a failed query must not also deliver results", listener.results);
+    }
+
+    /**
+     * The one behaviour difference that is not just a wider gate, pinned so it is a decision rather than a
+     * surprise: under a flat launch a plan-0 failure no longer suppresses the other plans. They are already
+     * dispatched by the time it reports, so the collector waits for them and reports plan 0's failure once —
+     * the mirror image of {@link #testPlanZeroFailureSkipsFanOut()}, which is the staged contract.
+     */
+    public void testFlatDispatchesEveryPlanEvenWhenPlanZeroFails() {
+        RuntimeException boom = new RuntimeException("plan 0 failed");
+        QueryPlans plans = plans(3);
+        Stub stub = new Stub(plans);
+        stub.failInline.put(0, boom);
+
+        CapturingListener listener = new CapturingListener();
+        flatExecutor(stub, 2).execute(plans, null, "test-index", listener);
+
+        assertEquals("a flat launch has no stage for plan 0 to gate", List.of(0, 1, 2), stub.dispatchOrder());
+        assertEquals(1, listener.terminalCalls);
+        assertSame(boom, listener.failure);
+        assertEquals("no plan may be left in flight", 0, stub.inFlight.get());
+    }
+
+    /**
+     * Turning the arm on is not by itself a widening: at the shipped {@code max_parallel_sub_plans = 1} the
+     * flat path settles on width 1 and takes the same sequential chain the staged path takes, from plan 0.
+     * That is what makes {@code flat} + {@code K = 1} a usable baseline cell for E5 rather than a third,
+     * untested behaviour.
+     */
+    public void testFlatAtWidthOneIsTheSequentialChain() {
+        QueryPlans plans = plans(4);
+        Stub stub = new Stub(plans);
+
+        PlainActionFuture<List<ExecutionResult>> future = new PlainActionFuture<>();
+        flatExecutor(stub, 1).execute(plans, null, "test-index", future);
+        List<ExecutionResult> results = future.actionGet();
+
+        assertEquals("width 1 must never have two plans outstanding", 1, stub.highWater.get());
+        assertEquals(List.of(0, 1, 2, 3), stub.dispatchOrder());
+        assertPlanOrder(plans, results);
+    }
+
+    /**
+     * The inline-drain bound counts <b>gated</b> plans, so it shifts by one between the arms: staged gates
+     * {@code n - 1} and flat gates {@code n}. At {@code n == MAX_FANOUT_PLANS} the flat path still fans out;
+     * at {@code n == MAX_FANOUT_PLANS + 1} it must fall back to sequential — the same plan count that
+     * {@link #testPlanCountAtTheInlineDrainBoundStillFansOut()} pins as the last one staged still fans out
+     * at. Without this the generalised bound could be reverted to {@code (n - 1)} and nothing would notice.
+     */
+    public void testFlatInlineDrainBoundCountsGatedPlans() {
+        QueryPlans atBound = plans(SubPlanParallelism.MAX_FANOUT_PLANS);
+        Stub atBoundStub = new Stub(atBound);
+        atBoundStub.deferAll = true;
+        CapturingListener atBoundListener = new CapturingListener();
+        flatExecutor(atBoundStub, 2).execute(atBound, null, "test-index", atBoundListener);
+        assertEquals("exactly MAX_FANOUT_PLANS gated plans must still fan out", 2, atBoundStub.inFlight.get());
+        while (atBoundListener.terminalCalls == 0) {
+            atBoundStub.completeAnyParked();
+        }
+        assertPlanOrder(atBound, atBoundListener.results);
+
+        QueryPlans pastBound = plans(SubPlanParallelism.MAX_FANOUT_PLANS + 1);
+        Stub pastBoundStub = new Stub(pastBound);
+        pastBoundStub.deferAll = true;
+        CapturingListener pastBoundListener = new CapturingListener();
+        flatExecutor(pastBoundStub, 2).execute(pastBound, null, "test-index", pastBoundListener);
+        assertEquals("one gated plan past the bound must be sequential", 1, pastBoundStub.inFlight.get());
+        assertEquals(List.of(0), pastBoundStub.dispatchOrder());
+        while (pastBoundListener.terminalCalls == 0) {
+            pastBoundStub.completeAnyParked();
+            assertTrue("the sequential path must never have two plans outstanding", pastBoundStub.inFlight.get() <= 1);
+        }
+        assertEquals(1, pastBoundStub.highWater.get());
+        assertPlanOrder(pastBound, pastBoundListener.results);
+    }
+
+    /**
+     * SC-10 under both arms: still exactly one width line per multi-plan query, and it now names the arm
+     * that produced the width. Without the {@code launch} field the two legs below are the same query with
+     * the same {@code K_setting} and the same {@code n} reporting different widths for no visible reason, so
+     * no benchmark cell could attribute a scraped {@code K_eff} to the arm that produced it.
+     */
+    public void testWidthLineNamesTheLaunchArmExactlyOnce() throws Exception {
+        QueryPlans flat = plans(2);
+        List<String> flatLines = runCapturingLogs(flatExecutor(new Stub(flat), 2), flat, K_EFF_TOKEN);
+        assertEquals("exactly one width line per multi-plan query, flat included", 1, flatLines.size());
+        Map<String, String> flatFields = parseKEffLine(flatLines.get(0));
+        assertEquals("flat", flatFields.get("launch"));
+        assertEquals("2", flatFields.get("n"));
+        assertEquals("both plans are gated under a flat launch", "2", flatFields.get("K_eff"));
+
+        QueryPlans staged = plans(2);
+        List<String> stagedLines = runCapturingLogs(executor(new Stub(staged), 2), staged, K_EFF_TOKEN);
+        assertEquals(1, stagedLines.size());
+        Map<String, String> stagedFields = parseKEffLine(stagedLines.get(0));
+        assertEquals("staged", stagedFields.get("launch"));
+        assertEquals("2", stagedFields.get("n"));
+        assertEquals("the same query, the same setting, and a width of 1 — hence the field", "1", stagedFields.get("K_eff"));
+    }
+
     // ── D2.2: the live SEARCH pool-size read ────────────────────────────────
 
     /**
@@ -1017,7 +1228,15 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         assertEquals("exactly one width line per multi-plan query", 1, lines.size());
     }
 
-    public void testKEffLineCarriesAllSevenFields() throws Exception {
+    /**
+     * The line's field set and order, and the one assertion in this class that was deliberately
+     * <b>changed</b> rather than added by the launch-mode work: the width line now carries an eighth field,
+     * {@code launch}, and this test used to require the line to <em>end</em> after {@code K_eff}. The
+     * original seven fields keep their names, their order and their positions — a scraper anchored to the
+     * leading {@code dsl.fanout.k_eff} token still matches — and the new field is appended, because without
+     * it the two arms of experiment E5 produce indistinguishable widths in the log.
+     */
+    public void testKEffLineCarriesEveryContractFieldInOrder() throws Exception {
         QueryPlans plans = plans(3);
         Stub stub = new Stub(plans);
 
@@ -1026,11 +1245,11 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         assertEquals(1, lines.size());
         String line = lines.get(0);
         assertTrue(
-            "the seven fields must appear in contract order, got: " + line,
+            "the eight fields must appear in contract order, got: " + line,
             Pattern.compile(
                 "^"
                     + Pattern.quote(K_EFF_TOKEN)
-                    + " K_setting=(\\S+) A=(\\S+) F=(\\S+) K_gate=(\\S+) K_search=(\\S+) n=(\\S+) K_eff=(\\S+)$"
+                    + " K_setting=(\\S+) A=(\\S+) F=(\\S+) K_gate=(\\S+) K_search=(\\S+) n=(\\S+) K_eff=(\\S+) launch=(\\S+)$"
             ).matcher(line).matches()
         );
         Map<String, String> fields = parseKEffLine(line);
@@ -1038,6 +1257,7 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         assertEquals("1", fields.get("F"));
         assertEquals("3", fields.get("n"));
         assertEquals("2", fields.get("K_eff"));
+        assertEquals("the shipped launch shape must name itself, not be inferred from the field's absence", "staged", fields.get("launch"));
     }
 
     public void testKEffLineRendersDroppedTermsAsAbsent() throws Exception {
@@ -1343,6 +1563,21 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
     }
 
     /**
+     * The same executor with the experimental flat launch selected. The mode is set through the real setting
+     * key rather than injected, so these tests also cover the {@code opensearch.yml} spelling an operator
+     * running experiment E5 would use.
+     */
+    private DslQueryPlanExecutor flatExecutor(QueryPlanExecutor<RelNode, Iterable<Object[]>> stub, int kSetting) {
+        return executor(
+            stub,
+            Settings.builder()
+                .put(DslQuerySettings.MAX_PARALLEL_SUB_PLANS.getKey(), kSetting)
+                .put(DslQuerySettings.FANOUT_LAUNCH.getKey(), DslQuerySettings.LaunchMode.FLAT.settingValue())
+                .build()
+        );
+    }
+
+    /**
      * Builds the executor over a real settings registry. The concurrency-gate multiplier is registered only
      * when a test passes its descriptor, so by default that term is absent and the width is
      * {@code min(n - 1, K_setting)} on every host.
@@ -1451,7 +1686,9 @@ public class DslQueryPlanExecutorTests extends OpenSearchTestCase {
         while (matcher.find()) {
             fields.put(matcher.group(1), matcher.group(2));
         }
-        assertEquals("the line must carry exactly the seven contract fields: " + line, 7, fields.size());
+        // Eight since the launch mode was appended for experiment E5: the original seven plus `launch`.
+        // Pinned as a count so a field cannot be silently dropped or added without a test saying so.
+        assertEquals("the line must carry exactly the eight contract fields: " + line, 8, fields.size());
         return fields;
     }
 

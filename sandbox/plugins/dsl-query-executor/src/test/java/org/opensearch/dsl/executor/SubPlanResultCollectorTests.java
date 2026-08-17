@@ -53,6 +53,52 @@ public class SubPlanResultCollectorTests extends OpenSearchTestCase {
         assertNotNull(new SubPlanResultCollector(2, new CapturingListener()));
     }
 
+    /**
+     * The flat launch's countdown: every plan is gated, so the collector expects {@code n} reports and
+     * {@code slotZero} is not used at all. The discriminating assertion is the middle one — with the staged
+     * count of {@code n - 1} the terminal would fire one report early, on plan 1, and deliver a list with a
+     * null in slot 0 (or, past the null guard, an {@code IllegalStateException} for a plan that was about to
+     * succeed).
+     */
+    public void testFlatLaunchCountsEveryPlanIncludingPlanZero() {
+        CapturingListener listener = new CapturingListener();
+        SubPlanResultCollector collector = new SubPlanResultCollector(3, 3, listener);
+
+        ExecutionResult zero = result();
+        ExecutionResult one = result();
+        ExecutionResult two = result();
+        // Plan 0 arrives like any other gated plan, and deliberately not first.
+        collector.planSucceeded(2, two);
+        collector.planSucceeded(1, one);
+        assertEquals("the terminal must wait for plan 0 as well under a flat launch", 0, listener.terminalCalls);
+
+        collector.planSucceeded(0, zero);
+
+        assertEquals(1, listener.terminalCalls);
+        assertNull("no plan failed: " + listener.failure, listener.failure);
+        assertEquals(List.of(zero, one, two), listener.results);
+    }
+
+    /**
+     * A report count the countdown could never reach is rejected for the same reason {@code n < 2} is: the
+     * tolerated form is a REST channel held open forever. {@code 0} can never reach a terminal at all, and
+     * {@code n + 1} cannot be driven to zero because only {@code n} plans exist to report.
+     */
+    public void testRejectsAReportCountTheCountdownCouldNeverReach() {
+        for (int reporters : new int[] { -1, 0, 4 }) {
+            CapturingListener listener = new CapturingListener();
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> new SubPlanResultCollector(3, reporters, listener)
+            );
+            assertEquals("a fan-out collector of 3 plans needs 1..3 reporters, got " + reporters, e.getMessage());
+            assertEquals("the listener must not have been touched", 0, listener.terminalCalls);
+        }
+        // Both ends of the accepted range: n - 1 is the staged count and n the flat one.
+        assertNotNull(new SubPlanResultCollector(3, 2, new CapturingListener()));
+        assertNotNull(new SubPlanResultCollector(3, 3, new CapturingListener()));
+    }
+
     public void testFiresOnceWhenAllSlotsFilled() {
         CapturingListener listener = new CapturingListener();
         SubPlanResultCollector collector = new SubPlanResultCollector(3, listener);

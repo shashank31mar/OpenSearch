@@ -33,13 +33,26 @@ import java.util.concurrent.ExecutorService;
  * Executes the plans of one DSL query through the analytics engine's {@link QueryPlanExecutor} and
  * collects their results in plan order.
  *
- * <p>Execution is <b>staged</b>: plan 0 runs alone, and only once it has succeeded do the remaining
- * {@code n - 1} plans go out through a permit gate of width {@code K_eff}
+ * <p>Execution is <b>staged</b> by default: plan 0 runs alone, and only once it has succeeded do the
+ * remaining {@code n - 1} plans go out through a permit gate of width {@code K_eff}
  * ({@link SubPlanParallelism}). Plan 0 first is not cosmetic — a plan whose parquet metadata is not yet
  * cached on the data node runs <i>unbudgeted</i> there, so launching all {@code K} at once would run
  * them all unbudgeted at exactly the moment {@code K} times the memory is in flight. The warm is
  * node-local and each plan resolves its own shard copies, so staging lowers the <em>expected</em> number
  * of concurrent unbudgeted queries rather than eliminating it.
+ *
+ * <p><b>The launch shape is switchable, for measurement only</b>
+ * ({@code dsl.query.fanout_launch}, default {@code staged} — see
+ * {@link DslQuerySettings#FANOUT_LAUNCH}). Staging costs the fan-out its first wave: the width can never
+ * exceed {@code n - 1}, so a 2-plan query — a 2-level nested aggregation with {@code size: 0}, the
+ * measured production shape — runs strictly sequentially however wide the gate is set. The design's
+ * experiment <b>E5 ("cold/warm x FLAT vs STAGED launch")</b> exists to decide whether that trade is
+ * right and has never been run, because until now there was nothing to compare against. Under
+ * {@code flat} all {@code n} plans go through the gate from the start, so {@code K_eff} can reach
+ * {@code n} — and no plan warms the metadata cache first, which is precisely the risk staging was
+ * chosen to reduce. Everything else is identical in both shapes: results are slotted by plan index,
+ * the request's listener fires exactly once, the first failure is the one reported, and no failure
+ * short-circuits a sibling that is still running.
  *
  * <p>At {@code K_eff == 1} — the shipped default, and also what the guards below fall back to — the call
  * sequence is the sequential chain this class has always used: plan {@code i + 1} is dispatched only
@@ -98,10 +111,17 @@ public class DslQueryPlanExecutor {
     /**
      * Executes all plans of one request and delivers their results, in plan order, to the listener.
      *
-     * <p>Plan 0 is dispatched alone. When it fails, the listener fails with that error and no fan-out is
-     * started. When it succeeds, {@code K_eff} is computed once (and logged once — the only observable
-     * the rollout and the benchmark cells attribute against) and the remaining plans run either
-     * sequentially ({@code K_eff == 1}) or through a permit gate.
+     * <p>Under the default staged launch, plan 0 is dispatched alone. When it fails, the listener fails
+     * with that error and no fan-out is started. When it succeeds, {@code K_eff} is computed once (and
+     * logged once — the only observable the rollout and the benchmark cells attribute against) and the
+     * remaining plans run either sequentially ({@code K_eff == 1}) or through a permit gate. Under the
+     * experimental flat launch the width is settled <em>before</em> anything is dispatched and all
+     * {@code n} plans go through the gate — see {@link #launchFlat}.
+     *
+     * <p>The launch mode is read <b>once per query</b>, here: it is a dynamic setting, and an update that
+     * landed between plan 0 and the fan-out would otherwise split one query across two launch shapes.
+     * A single-plan query takes the same path under either mode (there is nothing to fan out, and it
+     * emits no width line).
      *
      * <p>A synchronous throw out of plan 0's dispatch propagates to the caller. A synchronous throw out of
      * a <em>fanned-out</em> plan's dispatch is caught here instead: it happens on a finishing thread with a
@@ -127,6 +147,10 @@ public class DslQueryPlanExecutor {
             listener.onResponse(List.of());
             return;
         }
+        if (n > 1 && dslSettings.fanoutLaunch() == DslQuerySettings.LaunchMode.FLAT) {
+            launchFlat(queryPlans, n, state, concreteIndex, listener);
+            return;
+        }
         final QueryPlans.QueryPlan plan0 = queryPlans.get(0);
         logPlan(plan0.relNode());
         // TODO: context param is null, may carry execution hints
@@ -146,16 +170,59 @@ public class DslQueryPlanExecutor {
     }
 
     /**
-     * The {@code K_eff} decision, reached only from plan 0's callback: settles the width (emitting the one
-     * observability line for this query on every path through here) and never throws.
+     * The <b>flat</b> launch of experiment E5: settle the width first, then send all {@code n} plans
+     * through one permit gate. No plan runs alone, so {@code K_eff} is clamped to {@code n} rather than to
+     * {@code n - 1} and a 2-plan query can finally reach a width of 2 — the entire reason this arm exists.
+     *
+     * <p>Deliberately <em>not</em> a warm-up-free copy of {@link #fanOut}: it reuses that method's gate
+     * loop verbatim ({@link #dispatchGated}) and its collector, so the ordering, once-only-completion and
+     * permit accounting of the two shapes cannot drift apart. The only differences are the first gated
+     * index (0 rather than 1) and the collector's expected report count ({@code n} rather than
+     * {@code n - 1}), because here plan 0 is a gated plan like any other and {@code slotZero} is unused.
+     *
+     * <p>Two consequences of dispatching plan 0 through the gate are worth naming, because they are real
+     * behaviour differences and not oversights:
+     * <ul>
+     *   <li>The width is decided on the <b>calling</b> thread, before any plan runs, so a query whose
+     *       plan 0 fails no longer skips the width read. {@link #decideWidth} still cannot throw, so
+     *       nothing here can fail a search that the staged path would have answered.</li>
+     *   <li>A plan-0 failure no longer suppresses the other plans: they are already dispatched, so the
+     *       collector waits for all of them and reports plan 0's failure once, exactly as it would for any
+     *       other plan. Short-circuiting instead would abandon in-flight distributed queries.</li>
+     * </ul>
+     */
+    private void launchFlat(
+        List<QueryPlans.QueryPlan> queryPlans,
+        int n,
+        ClusterState state,
+        String concreteIndex,
+        ActionListener<List<ExecutionResult>> listener
+    ) {
+        final int kEff = decideWidth(n, n, DslQuerySettings.LaunchMode.FLAT, state, concreteIndex);
+        if (kEff == 1) {
+            // A width-1 gate is the sequential chain with extra bookkeeping, so take the chain itself —
+            // the same one the staged path takes at width 1, from plan 0 instead of plan 1. That keeps the
+            // degraded flat arm byte-identical to the sequential baseline it is measured against.
+            executeNext(queryPlans, 0, new ArrayList<>(n), listener);
+            return;
+        }
+        dispatchGated(queryPlans, 0, n, new SubPlanResultCollector(n, n, listener), new PendingExecutions(kEff));
+    }
+
+    /**
+     * The {@code K_eff} decision: settles the width (emitting the one observability line for this query on
+     * every path through here) and never throws. Reached from plan 0's callback under a staged launch, and
+     * from the calling thread before any dispatch under a flat one.
      *
      * <p><b>Not throwing is the contract, not defensiveness.</b> Every individual input is already
      * fail-secure on its own — {@code DslGateInputs} catches per key and drops the term,
-     * {@code CoordinatorShardLayout} degrades to 1 — but this <em>composition</em> runs inside plan 0's
-     * success callback, whose {@code ActionListener.wrap} routes anything thrown here to the request's
-     * failure arm. A width read that threw would therefore fail a search whose plan 0 had already
-     * succeeded, which contradicts the one tenet this whole path is built on: a wrong fan-out width must
-     * never fail a search. Two reads here are unguarded by their own producers and can genuinely throw —
+     * {@code CoordinatorShardLayout} degrades to 1 — but under a staged launch this <em>composition</em>
+     * runs inside plan 0's success callback, whose {@code ActionListener.wrap} routes anything thrown here
+     * to the request's failure arm. A width read that threw would therefore fail a search whose plan 0 had
+     * already succeeded, which contradicts the one tenet this whole path is built on: a wrong fan-out width
+     * must never fail a search. (Under a flat launch it runs before any dispatch, where a throw would
+     * instead escape {@code execute} into the caller — the same tenet, one frame further out.) Two reads
+     * here are unguarded by their own producers and can genuinely throw —
      * {@code DslGateInputs.targetPartitions()} resolves two {@code :server} settings <em>typed</em>
      * ({@code ClusterSettings.get(Setting)} throws when a key stops being registered, e.g. after an
      * upgrade), and {@code threadPool.executor(SEARCH)} throws if that pool is not registered. Both
@@ -165,11 +232,14 @@ public class DslQueryPlanExecutor {
      * on all three paths and no path can emit it twice.
      *
      * @param n number of plans in this query, always {@code >= 2} here
+     * @param gatedPlans how many of them this launch sends through the gate: {@code n - 1} staged, {@code n} flat
+     * @param launch the launch mode this query is running under, reported on the width line so a benchmark
+     *               cell can attribute a number to an arm
      * @param state the request's snapshot, source of the shard-layout read
      * @param concreteIndex the request's resolved concrete index, or null
      * @return the width to run at, always {@code >= 1}
      */
-    private int decideWidth(int n, ClusterState state, String concreteIndex) {
+    private int decideWidth(int n, int gatedPlans, DslQuerySettings.LaunchMode launch, ClusterState state, String concreteIndex) {
         // Boxed so "not read yet" is representable: the sentinel renders as the state string below. Today
         // this read cannot throw (DslQuerySettings caches the value in a volatile field and refreshes it
         // from a settings-update consumer), which is exactly why it is the read taken FIRST — but a later
@@ -183,8 +253,9 @@ public class DslQueryPlanExecutor {
             // on the finishing thread, so a callee that completes inline nests one frame group per plan.
             // Above the bound, take the sequential path instead of trampolining every hand-off through the
             // SEARCH pool — that would add a SEARCH admission per plan completion on a path whose
-            // coordinator demand is already K_eff + 1.
-            boolean tooManyPlans = (n - 1) > SubPlanParallelism.MAX_FANOUT_PLANS;
+            // coordinator demand is already K_eff + 1. Counted in GATED plans, not in n: the nesting comes
+            // from the plans that go through the gate, which is n - 1 staged and n flat.
+            boolean tooManyPlans = gatedPlans > SubPlanParallelism.MAX_FANOUT_PLANS;
             // Ordered cheapest-decisive-first, deliberately. At the shipped default
             // (max_parallel_sub_plans = 1) and above the plan bound, K_eff is 1 whatever every other term
             // says, so reading them would be pure waste on the query hot path: readInputs() runs
@@ -193,7 +264,7 @@ public class DslQueryPlanExecutor {
             // as `skipped` below rather than as a number, because "never read" and "read and dropped"
             // (`absent`) mean opposite things to the runbook.
             if (kSetting > 1 && tooManyPlans == false) {
-                decision = SubPlanParallelism.decide(readInputs(n, kSetting, state, concreteIndex));
+                decision = SubPlanParallelism.decide(readInputs(n, kSetting, state, concreteIndex), gatedPlans);
             }
         } catch (RuntimeException e) {
             // DEBUG, not WARN: on a node whose registry really did lose a key this fires on every
@@ -204,12 +275,13 @@ public class DslQueryPlanExecutor {
             unread = TERM_UNAVAILABLE;
         }
         int kEff = decision == null ? 1 : decision.kEff();
-        logKEff(kSetting, decision, unread, n, kEff);
+        logKEff(kSetting, decision, unread, n, kEff, launch);
         return kEff;
     }
 
     /**
      * Dispatches the remaining plans at the settled width: either the sequential chain or a permit gate.
+     * The staged launch's half of the decision — plan 0 has already succeeded when this runs.
      */
     private void fanOut(
         List<QueryPlans.QueryPlan> queryPlans,
@@ -219,7 +291,7 @@ public class DslQueryPlanExecutor {
         String concreteIndex,
         ActionListener<List<ExecutionResult>> listener
     ) {
-        final int kEff = decideWidth(n, state, concreteIndex);
+        final int kEff = decideWidth(n, n - 1, DslQuerySettings.LaunchMode.STAGED, state, concreteIndex);
 
         if (kEff == 1) {
             // Byte-identical to the pre-fan-out behaviour, including its fail-fast: the sequential path is
@@ -232,8 +304,32 @@ public class DslQueryPlanExecutor {
 
         SubPlanResultCollector collector = new SubPlanResultCollector(n, listener);
         collector.slotZero(result0);
-        PendingExecutions gate = new PendingExecutions(kEff);
-        for (int i = 1; i < n; i++) {
+        dispatchGated(queryPlans, 1, n, collector, new PendingExecutions(kEff));
+    }
+
+    /**
+     * Sends plans {@code [from, n)} through one permit gate, reporting each to the collector by its own
+     * plan index. The single copy of the fan-out's permit accounting: the staged launch enters at
+     * {@code from = 1} (plan 0 already ran alone and was slotted), the flat launch at {@code from = 0}.
+     *
+     * <p>A synchronous throw out of a plan's dispatch is caught here rather than propagated: it happens on
+     * a finishing thread with a permit held, so it has to release the permit and drive the countdown rather
+     * than escape.
+     *
+     * @param queryPlans the query's plans
+     * @param from the first plan index to gate
+     * @param n the query's plan count, i.e. the exclusive upper bound of the dispatch
+     * @param collector the collector every gated plan reports to, already sized for {@code n - from} reports
+     * @param gate a fresh gate of the settled width, owned by this dispatch alone
+     */
+    private void dispatchGated(
+        List<QueryPlans.QueryPlan> queryPlans,
+        int from,
+        int n,
+        SubPlanResultCollector collector,
+        PendingExecutions gate
+    ) {
+        for (int i = from; i < n; i++) {
             final int idx = i;
             final QueryPlans.QueryPlan plan = queryPlans.get(idx);
             // notifyOnce is OUTERMOST, and that order is load-bearing. runAfter fires its Runnable from a
@@ -318,6 +414,10 @@ public class DslQueryPlanExecutor {
      * The sequential chain: dispatch plan {@code index}, and only from its success callback dispatch
      * plan {@code index + 1}. The first failure ends the chain — the listener fires {@code onFailure} with
      * that error and the remaining plans do not run.
+     *
+     * <p>Entered at {@code index = 1} by the staged launch (plan 0 having already run and been appended to
+     * {@code results}) and at {@code index = 0} by a flat launch that settled on width 1, where there is
+     * nothing for a gate to overlap and the chain is the baseline both arms are measured against.
      */
     private void executeNext(
         List<QueryPlans.QueryPlan> queryPlans,
@@ -416,8 +516,16 @@ public class DslQueryPlanExecutor {
      * gate is indistinguishable from a K=1 baseline.
      *
      * <p>Contract, not style: the fixed leading token {@code dsl.fanout.k_eff} (what the runbook greps
-     * for), exactly these seven fields in this order, INFO level (the runbook reads it on a production
-     * canary, where DEBUG is off), once per query at the decision site — not per plan, not in the loop.
+     * for), then the original seven fields in this order, then {@code launch}, INFO level (the runbook
+     * reads it on a production canary, where DEBUG is off), once per query at the decision site — not per
+     * plan, not in the loop.
+     *
+     * <p>{@code launch} is appended rather than inserted, and it is not optional. It names the launch shape
+     * ({@code staged} / {@code flat}) that produced this width, and without it the two arms of experiment
+     * E5 are indistinguishable in the logs: the same {@code K_setting} and {@code n} yield different widths
+     * per arm, so a scraped {@code K_eff} could not be attributed to the arm that produced it. Appending
+     * keeps the leading token and the seven original field positions intact for anything already matching
+     * the line; a reader that anchored its regex to the end of the line has to be updated once.
      *
      * <p><b>TEMPORARY at INFO, for the rollout only.</b> One line per multi-plan search is unbounded volume
      * on the query hot path, and the only way to silence it today is to raise this whole class's logger,
@@ -450,17 +558,26 @@ public class DslQueryPlanExecutor {
      * @param unread how to render the terms {@code decision} does not carry
      * @param n the query's plan count
      * @param kEff the width this query runs at
+     * @param launch the launch shape that produced that width
      */
-    private void logKEff(Integer kSetting, SubPlanParallelism.Decision decision, String unread, int n, int kEff) {
+    private void logKEff(
+        Integer kSetting,
+        SubPlanParallelism.Decision decision,
+        String unread,
+        int n,
+        int kEff,
+        DslQuerySettings.LaunchMode launch
+    ) {
         logger.info(
-            "dsl.fanout.k_eff K_setting={} A={} F={} K_gate={} K_search={} n={} K_eff={}",
+            "dsl.fanout.k_eff K_setting={} A={} F={} K_gate={} K_search={} n={} K_eff={} launch={}",
             kSetting == null ? unread : String.valueOf(kSetting),
             decision == null ? unread : String.valueOf(decision.a()),
             decision == null ? unread : String.valueOf(decision.f()),
             decision == null ? unread : bound(decision.kGate()),
             decision == null ? unread : bound(decision.kSearch()),
             n,
-            kEff
+            kEff,
+            launch.settingValue()
         );
     }
 
